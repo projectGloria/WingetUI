@@ -1,0 +1,12 @@
+# Runtime & user data
+Data/
+
+# Build outputs & fetched WebView2 binaries
+dist/
+*.exe
+*.dll
+webview2_pkg.zip
+webview2_tmp/
+
+# Leftover screenshots
+test_*.png

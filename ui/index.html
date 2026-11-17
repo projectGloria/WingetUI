@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Winget Baby — Package & Preset Manager</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Startup splash: stays up until the host finishes the initial scan -->
+  <div class="splash" id="splash">
+    <button class="splash-close" id="splash-close" title="Close" aria-label="Close">&times;</button>
+    <div class="splash-inner">
+      <div class="splash-logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+          <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+          <line x1="12" y1="22.08" x2="12" y2="12"/>
+        </svg>
+      </div>
+      <h1 class="splash-title">Winget Baby</h1>
+      <div class="splash-phase" id="splash-phase">Starting up</div>
+
+      <div class="splash-current" id="splash-current">
+        <div id="splash-current-icon" class="splash-current-icon"></div>
+        <div class="splash-current-text">
+          <div class="splash-current-name" id="splash-current-name">&nbsp;</div>
+          <div class="splash-current-id" id="splash-current-id">&nbsp;</div>
+        </div>
+      </div>
+
+      <div class="splash-bar indeterminate" id="splash-bar"><div class="splash-bar-fill" id="splash-bar-fill"></div></div>
+      <div class="splash-count" id="splash-count">&nbsp;</div>
+
+      <div class="splash-tiles" id="splash-tiles"></div>
+    </div>
+  </div>
+
+  <div class="app-shell">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+            <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+            <line x1="12" y1="22.08" x2="12" y2="12"/>
+          </svg>
+        </div>
+        <div>
+          <div class="brand-title">Winget Baby</div>
+          <div class="brand-sub">Fast Package Manager</div>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <button class="nav-item active" data-tab="presets">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
+          <span>My Presets</span>
+          <span class="nav-badge" id="badge-presets">0/0</span>
+        </button>
+
+        <button class="nav-item" data-tab="updates">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <span>Updates</span>
+          <span class="nav-badge badge-amber" id="badge-updates">0</span>
+        </button>
+
+        <button class="nav-item" data-tab="installed">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          <span>Installed Apps</span>
+          <span class="nav-badge" id="badge-installed">0</span>
+        </button>
+
+        <button class="nav-item" data-tab="search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <span>Winget Search</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-section">
+        <div class="sidebar-label">INSTALL OPTIONS</div>
+        <label class="toggle-row" title="Pass --silent flag to winget install/upgrade">
+          <span>Silent Mode (<code>--silent</code>)</span>
+          <input type="checkbox" id="toggle-silent" />
+          <span class="toggle-switch"></span>
+        </label>
+      </div>
+
+      <div class="sidebar-footer">
+        <button class="btn btn-secondary btn-full" id="btn-export-txt" title="Save current presets back to winget.txt">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+          <span>Sync to winget.txt</span>
+        </button>
+        <div class="scan-status" id="scan-status-text">Ready</div>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-area">
+      <!-- Top Bar -->
+      <header class="topbar">
+        <div class="search-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="global-filter" placeholder="Filter presets by name, ID, or category..." autocomplete="off" />
+          <button class="clear-input hidden" id="btn-clear-filter">&times;</button>
+        </div>
+
+        <div class="topbar-actions">
+          <button class="btn btn-ghost" id="btn-add-preset" title="Add a custom app to your presets">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            <span>Add App</span>
+          </button>
+
+          <button class="btn btn-ghost" id="btn-refresh" title="Re-scan installed packages & available updates">
+            <svg class="icon-spin-target" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            <span>Refresh Status</span>
+          </button>
+        </div>
+
+        <div class="window-controls">
+          <button class="win-btn win-btn-min" id="win-btn-minimize" title="Minimize" aria-label="Minimize">
+            <svg viewBox="0 0 10 10"><line x1="1" y1="5" x2="9" y2="5" stroke="currentColor" stroke-width="1.2"/></svg>
+          </button>
+          <button class="win-btn win-btn-max" id="win-btn-maximize" title="Maximize" aria-label="Maximize">
+            <svg id="icon-win-max" viewBox="0 0 10 10"><rect x="1.5" y="1.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+            <svg id="icon-win-restore" class="hidden" viewBox="0 0 10 10">
+              <rect x="3" y="1" width="6" height="6" fill="none" stroke="currentColor" stroke-width="1.1"/>
+              <polyline points="1,3 1,9 7,9" fill="none" stroke="currentColor" stroke-width="1.1"/>
+            </svg>
+          </button>
+          <button class="win-btn win-btn-close" id="win-btn-close" title="Close" aria-label="Close">
+            <svg viewBox="0 0 10 10">
+              <line x1="1.5" y1="1.5" x2="8.5" y2="8.5" stroke="currentColor" stroke-width="1.2"/>
+              <line x1="8.5" y1="1.5" x2="1.5" y2="8.5" stroke="currentColor" stroke-width="1.2"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- TAB 1: MY PRESETS -->
+      <section class="tab-view active" id="view-presets">
+        <div class="toolbar-row">
+          <div class="category-pills" id="category-pills"></div>
+          <div class="quick-select-group">
+            <button class="btn-chip" id="btn-select-missing">Select Missing</button>
+            <button class="btn-chip" id="btn-select-updates">Select Updatable</button>
+            <button class="btn-chip" id="btn-select-all">Select All</button>
+            <button class="btn-chip" id="btn-select-none">Clear</button>
+          </div>
+        </div>
+
+        <!-- Batch Action Banner -->
+        <div class="batch-banner hidden" id="batch-banner">
+          <div class="batch-info">
+            <span class="batch-count" id="batch-count">0</span> apps selected
+          </div>
+          <div class="batch-buttons">
+            <button class="btn btn-primary" id="btn-batch-install">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span>Install Selected</span>
+            </button>
+            <button class="btn btn-amber" id="btn-batch-update">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              <span>Update Selected</span>
+            </button>
+            <button class="btn btn-danger-outline" id="btn-batch-uninstall">
+              <span>Uninstall Selected</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="presets-container" id="presets-container"></div>
+      </section>
+
+      <!-- TAB 2: UPDATES -->
+      <section class="tab-view" id="view-updates">
+        <div class="section-header">
+          <div>
+            <h2>Available Package Updates</h2>
+            <p class="section-sub">Outdated packages detected via <code>winget list</code> &amp; <code>winget upgrade</code></p>
+          </div>
+          <div class="header-btns">
+            <button class="btn btn-ghost" id="btn-check-updates">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              <span>Deep Scan Updates</span>
+            </button>
+            <button class="btn btn-amber" id="btn-update-all">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span>Update All Packages</span>
+            </button>
+          </div>
+        </div>
+        <div class="table-card" id="updates-table-wrap"></div>
+      </section>
+
+      <!-- TAB 3: INSTALLED APPS -->
+      <section class="tab-view" id="view-installed">
+        <div class="section-header">
+          <div>
+            <h2>Installed Packages</h2>
+            <p class="section-sub">All software detected on this PC by Windows Package Manager</p>
+          </div>
+          <div class="header-btns">
+            <label class="checkbox-inline">
+              <input type="checkbox" id="filter-winget-only" checked />
+              <span>Show Winget/Store packages only</span>
+            </label>
+          </div>
+        </div>
+        <div class="table-card" id="installed-table-wrap"></div>
+      </section>
+
+      <!-- TAB 4: WINGET SEARCH -->
+      <section class="tab-view" id="view-search">
+        <div class="section-header">
+          <div>
+            <h2>Search Winget Repository</h2>
+            <p class="section-sub">Find any app in the official Windows Package Manager catalog to install or save to your presets</p>
+          </div>
+        </div>
+        <form class="repo-search-bar" id="form-repo-search">
+          <input type="text" id="input-repo-search" placeholder="Search Winget catalog (e.g. Obsidian, VLC, Blender, Rustup)..." autocomplete="off" />
+          <button type="submit" class="btn btn-primary" id="btn-repo-search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <span>Search Repository</span>
+          </button>
+        </form>
+        <div class="search-filter-row">
+          <label class="checkbox-inline">
+            <input type="checkbox" id="filter-trusted-only" checked />
+            <span>Verified publishers only</span>
+          </label>
+          <span class="search-trust-note" id="search-trust-note"></span>
+        </div>
+        <div class="table-card" id="search-table-wrap">
+          <div class="empty-state">Enter a package name or ID above to search the official Winget catalog.</div>
+        </div>
+      </section>
+
+      <!-- Bottom Console & Queue Drawer -->
+      <footer class="console-drawer" id="console-drawer">
+        <div class="console-bar" id="console-bar">
+          <div class="console-status-left">
+            <span class="status-dot" id="task-dot"></span>
+            <span class="console-title" id="task-summary">Idle — No active tasks</span>
+            <span class="queue-pill hidden" id="queue-pill">0 queued</span>
+          </div>
+          <div class="console-actions">
+            <button class="btn btn-danger-sm hidden" id="btn-cancel-task">Cancel</button>
+            <button class="btn-icon" id="btn-clear-log" title="Clear log output">Clear</button>
+            <button class="btn-icon" id="btn-toggle-console" title="Toggle live terminal output">
+              <span id="console-toggle-label">Terminal ▲</span>
+            </button>
+          </div>
+        </div>
+        <div class="console-body hidden" id="console-body">
+          <pre id="console-output">Winget Baby ready. Select packages above to install, update, or uninstall.</pre>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Modal: Add Custom Preset App -->
+  <div class="modal-backdrop hidden" id="modal-add-preset">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Add App to My Presets</h3>
+        <button class="btn-close" id="btn-close-modal">&times;</button>
+      </div>
+      <form id="form-add-preset">
+        <div class="form-group">
+          <label>Display Name</label>
+          <input type="text" id="preset-app-name" required placeholder="e.g. Obsidian" />
+        </div>
+        <div class="form-group">
+          <label>Winget Package ID</label>
+          <input type="text" id="preset-app-id" required placeholder="e.g. Obsidian.Obsidian" />
+        </div>
+        <div class="form-group">
+          <label>Category</label>
+          <select id="preset-app-category"></select>
+        </div>
+        <div class="form-group">
+          <label>Short Description (optional)</label>
+          <input type="text" id="preset-app-desc" placeholder="e.g. Knowledge base and Markdown note-taking app" />
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" id="btn-cancel-modal">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save to Presets</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: App Details & Authenticity Verification -->
+  <div class="modal-backdrop hidden" id="modal-app-details">
+    <div class="modal-card modal-card-lg">
+      <div class="modal-header">
+        <div class="detail-header-left">
+          <div class="app-icon-wrap" id="detail-icon-wrap"></div>
+          <div class="detail-header-titles">
+            <div class="detail-title-line">
+              <h2 id="detail-app-name">Package Details</h2>
+              <span class="badge-source" id="detail-verified-badge">✓ Official</span>
+            </div>
+            <div class="detail-sub-line">
+              <span class="pkg-id" id="detail-pkg-id" title="Click to copy ID">...</span>
+              <span class="version-tag" id="detail-version">...</span>
+            </div>
+          </div>
+        </div>
+        <button class="btn-close" id="btn-close-details" title="Close">&times;</button>
+      </div>
+
+      <div class="modal-body-scroll" id="detail-modal-body">
+        <!-- Loading state -->
+        <div class="detail-loading" id="detail-loading">
+          <div class="spinner"></div>
+          <span>Querying package authenticity &amp; metadata from Windows Package Manager...</span>
+        </div>
+
+        <!-- Loaded Content -->
+        <div class="detail-content hidden" id="detail-content">
+          <!-- Official / Security Trust Banner -->
+          <div class="trust-banner" id="detail-trust-banner">
+            <div class="trust-badge-icon" id="trust-badge-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                <polyline points="9 12 11 14 15 10"/>
+              </svg>
+            </div>
+            <div class="trust-text">
+              <div class="trust-title" id="trust-title">Official Windows Package</div>
+              <div class="trust-desc" id="trust-desc">Validated and distributed through the official Microsoft Windows Package Manager repository.</div>
+            </div>
+          </div>
+
+          <!-- Description -->
+          <div class="detail-section" id="section-description">
+            <div class="section-title">ABOUT</div>
+            <p class="detail-desc-text" id="detail-description">No description provided.</p>
+          </div>
+
+          <!-- Metadata Specs Grid -->
+          <div class="detail-grid">
+            <div class="detail-prop">
+              <span class="prop-label">PUBLISHER</span>
+              <span class="prop-val" id="detail-publisher">—</span>
+            </div>
+            <div class="detail-prop">
+              <span class="prop-label">AUTHOR</span>
+              <span class="prop-val" id="detail-author">—</span>
+            </div>
+            <div class="detail-prop">
+              <span class="prop-label">CATALOG SOURCE</span>
+              <span class="prop-val" id="detail-source">—</span>
+            </div>
+            <div class="detail-prop">
+              <span class="prop-label">RELEASE DATE</span>
+              <span class="prop-val" id="detail-release-date">—</span>
+            </div>
+            <div class="detail-prop">
+              <span class="prop-label">LICENSE</span>
+              <span class="prop-val" id="detail-license">—</span>
+            </div>
+            <div class="detail-prop">
+              <span class="prop-label">INSTALLER TYPE</span>
+              <span class="prop-val" id="detail-installer-type">—</span>
+            </div>
+          </div>
+
+          <!-- Integrity & Links -->
+          <div class="detail-section">
+            <div class="section-title">VERIFICATION &amp; SOURCE URLS</div>
+            <div class="integrity-card">
+              <div class="integrity-row hidden" id="row-homepage">
+                <span class="integrity-label">Official Website:</span>
+                <a class="integrity-url" id="link-homepage" target="_blank" rel="noreferrer">Open Website ↗</a>
+              </div>
+              <div class="integrity-row hidden" id="row-publisher-url">
+                <span class="integrity-label">Publisher URL:</span>
+                <a class="integrity-url" id="link-publisher" target="_blank" rel="noreferrer">Publisher Page ↗</a>
+              </div>
+              <div class="integrity-row hidden" id="row-privacy-url">
+                <span class="integrity-label">Privacy Policy:</span>
+                <a class="integrity-url" id="link-privacy" target="_blank" rel="noreferrer">Privacy Policy ↗</a>
+              </div>
+              <div class="integrity-row hidden" id="row-release-notes">
+                <span class="integrity-label">Release Notes:</span>
+                <a class="integrity-url" id="link-release-notes" target="_blank" rel="noreferrer">View Notes ↗</a>
+              </div>
+              <div class="integrity-row" id="row-download-host">
+                <span class="integrity-label">Download Host:</span>
+                <span class="integrity-text" id="detail-download-host">—</span>
+              </div>
+              <div class="integrity-row" id="row-sha256">
+                <span class="integrity-label">SHA-256 Hash:</span>
+                <code class="integrity-hash" id="detail-sha256" title="Click to copy SHA-256">—</code>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <div class="modal-footer-left">
+          <span class="status-pill status-missing" id="detail-install-status">Not Installed</span>
+        </div>
+        <div class="modal-footer-right">
+          <button class="btn btn-secondary" id="btn-detail-add-preset">+ Add to Presets</button>
+          <button class="btn btn-primary" id="btn-detail-action">Install</button>
+          <button class="btn btn-ghost" id="btn-detail-close">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
