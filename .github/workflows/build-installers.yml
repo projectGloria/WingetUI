@@ -1,0 +1,140 @@
+name: Build Installers
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for the installer (e.g. 1.0.0). Defaults to 0.0.0-dev.<run_number>."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows x64 Installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: meta
+        shell: powershell
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if ($env:REF_TYPE -eq "tag") {
+            $version = $env:REF_NAME -replace "^v", ""
+          } elseif (-not [string]::IsNullOrWhiteSpace($env:INPUT_VERSION)) {
+            $version = $env:INPUT_VERSION.Trim() -replace "^v", ""
+          } else {
+            $version = "0.0.0-dev.$($env:RUN_NUMBER)"
+          }
+
+          if ($version -notmatch "^[0-9A-Za-z._-]+$") {
+            throw "Invalid version string: '$version'"
+          }
+
+          Write-Host "Resolved version: $version"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Cache WebView2 runtime libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            Microsoft.Web.WebView2.Core.dll
+            Microsoft.Web.WebView2.WinForms.dll
+            WebView2Loader.dll
+          key: webview2-windows-x64-${{ hashFiles('build.ps1') }}
+
+      - name: Build Winget Baby
+        shell: powershell
+        run: |
+          .\build.ps1
+          if (-not (Test-Path ".\dist\WingetBaby\WingetUI.exe")) {
+            throw "Expected build output dist\WingetBaby\WingetUI.exe was not produced"
+          }
+
+      - name: Build Windows installer (Inno Setup)
+        shell: powershell
+        env:
+          APP_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $isccCandidates = @(
+            (Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+
+          $iscc = $isccCandidates | Select-Object -First 1
+          if (-not $iscc) {
+            Write-Host "Inno Setup not found; installing via Chocolatey..."
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to install Inno Setup (exit code $LASTEXITCODE)"
+            }
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $iscc)) {
+              throw "ISCC.exe not found after installation"
+            }
+          }
+
+          New-Item -ItemType Directory -Path ".\installers" -Force | Out-Null
+          $sourceDir = (Resolve-Path ".\dist\WingetBaby").Path
+          $outputDir = (Resolve-Path ".\installers").Path
+          $baseName = "WingetBaby-$($env:APP_VERSION)-windows-x64"
+
+          & $iscc `
+            "/DAppVersion=$($env:APP_VERSION)" `
+            "/DSourceDir=$sourceDir" `
+            "/DOutputDir=$outputDir" `
+            "/DOutputBaseFilename=$baseName" `
+            ".\installer\WingetBaby.iss"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
+          }
+
+          $installerPath = Join-Path $outputDir "$baseName.exe"
+          if (-not (Test-Path $installerPath)) {
+            throw "Expected installer was not produced: $installerPath"
+          }
+
+          Get-ChildItem $outputDir
+
+      - name: Upload installers artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers
+          path: installers/*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download installers artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: installers
+          path: installers
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installers/*
+          generate_release_notes: true

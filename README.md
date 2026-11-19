@@ -24,6 +24,7 @@
   <a href="#installation">Installation</a> &middot;
   <a href="#usage">Usage</a> &middot;
   <a href="#building-from-source">Building from Source</a> &middot;
+  <a href="#how-to-release">How to Release</a> &middot;
   <a href="#configuration">Configuration</a> &middot;
   <a href="#contributing">Contributing</a>
 </p>
@@ -146,6 +147,18 @@ On first launch, Winget Baby copies the seed [presets.json](presets.json) into `
 
 > [!NOTE]
 > Frontend edits under `ui/` do not require recompiling `WingetUI.exe`—just restart the app.
+
+## How to Release
+
+Pushing a version tag starting with `v` triggers the [Build Installers](.github/workflows/build-installers.yml) workflow on GitHub Actions, which compiles the Windows x64 Inno Setup installer (`WingetBaby-<version>-windows-x64.exe`), uploads it as the `installers` workflow artifact, and publishes a GitHub Release with the installer attached:
+
+```bash
+git tag v1.0.0
+git push --tags
+```
+
+- **Download released installers**: Go to the repository's [Releases](https://github.com/projectGloria/WingetUI/releases) page and download `WingetBaby-<version>-windows-x64.exe`.
+- **Manual test builds (without publishing a release)**: Open **Actions → Build Installers → Run workflow** on GitHub, optionally enter a version string, and download the `installers` artifact from the completed workflow run.
 
 ## Configuration
 

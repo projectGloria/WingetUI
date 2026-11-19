@@ -3,6 +3,7 @@ Data/
 
 # Build outputs & fetched WebView2 binaries
 dist/
+installers/
 *.exe
 *.dll
 webview2_pkg.zip
