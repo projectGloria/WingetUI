@@ -61,6 +61,8 @@ namespace WingetBabyUI
         private string metaCachePath;
         private bool devTools;
         private int scanBusy = 0;      // 1 while a scan_installed run is in flight
+        private int scanPending = 0;   // 1 if another scan_installed was requested while scanBusy == 1
+        private volatile bool activeTaskCancelled = false;
         private Process activeProcess = null;
         private readonly object procLock = new object();
         private readonly object cacheLock = new object();
@@ -80,6 +82,7 @@ namespace WingetBabyUI
         public MainForm()
         {
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            ServicePointManager.DefaultConnectionLimit = 16;
             appDir = AppDomain.CurrentDomain.BaseDirectory;
             json = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
             devTools = Array.IndexOf(Environment.GetCommandLineArgs(), "--devtools") >= 0;
@@ -372,7 +375,8 @@ namespace WingetBabyUI
 
                     case "search_winget":
                         string query = msg.ContainsKey("query") ? Convert.ToString(msg["query"]) : "";
-                        await Task.Run(() => HandleSearchWinget(query));
+                        int searchSeq = msg.ContainsKey("seq") ? Convert.ToInt32(msg["seq"]) : 0;
+                        await Task.Run(() => HandleSearchWinget(query, searchSeq));
                         break;
 
                     case "run_winget_task":
@@ -385,7 +389,8 @@ namespace WingetBabyUI
                         break;
 
                     case "cancel_task":
-                        KillActiveProcess();
+                        activeTaskCancelled = true;
+                        await Task.Run(() => KillActiveProcess());
                         SendToUi(new { type = "task_cancelled" });
                         break;
 
@@ -399,9 +404,11 @@ namespace WingetBabyUI
 
                     case "open_url":
                         string url = msg.ContainsKey("url") ? Convert.ToString(msg["url"]) : "";
-                        if (url.StartsWith("http://") || url.StartsWith("https://"))
+                        Uri parsedUrl;
+                        if (Uri.TryCreate(url, UriKind.Absolute, out parsedUrl) &&
+                            (parsedUrl.Scheme == Uri.UriSchemeHttp || parsedUrl.Scheme == Uri.UriSchemeHttps))
                         {
-                            Process.Start(url);
+                            Process.Start(parsedUrl.AbsoluteUri);
                         }
                         break;
 
@@ -480,61 +487,73 @@ namespace WingetBabyUI
 
         private void HandleScanInstalled(bool startup)
         {
-            // A second scan racing the first would double every winget/HTTP call
-            if (Interlocked.CompareExchange(ref scanBusy, 1, 0) != 0) return;
+            // Coalesce concurrent scan requests so a post-task refresh is never silently dropped
+            if (Interlocked.CompareExchange(ref scanBusy, 1, 0) != 0)
+            {
+                Interlocked.Exchange(ref scanPending, 1);
+                return;
+            }
             string error = "";
             try
             {
-                SendToUi(new { type = "scan_status", status = "scanning" });
-                SendScanProgress("Querying Windows Package Manager", 0, 0, "", "");
-                string output = RunWingetCapture("list --accept-source-agreements --disable-interactivity");
-                var packages = ParseWingetTable(output);
-
-                SendScanProgress("Reading installed applications", 0, packages.Count, "", "");
-                AttachLocalRegistryIcons(packages);
-
-                SendToUi(new
+                do
                 {
-                    type = "installed_list",
-                    packages = packages,
-                    timestamp = DateTime.Now.ToString("HH:mm:ss")
-                });
+                    Interlocked.Exchange(ref scanPending, 0);
+                    detailsCache.Clear();
+                    error = "";
+                    SendToUi(new { type = "scan_status", status = "scanning" });
+                    SendScanProgress("Querying Windows Package Manager", 0, 0, "", "");
+                    string output = RunWingetCapture("list --accept-source-agreements --disable-interactivity");
+                    var packages = ParseWingetTable(output);
 
-                if (packages.Count == 0)
-                {
-                    error = (output ?? "").StartsWith("Error:") ? output : "winget returned no installed packages.";
+                    SendScanProgress("Reading installed applications", 0, packages.Count, "", "");
+                    AttachLocalRegistryIcons(packages);
+
+                    SendToUi(new
+                    {
+                        type = "installed_list",
+                        packages = packages,
+                        timestamp = DateTime.Now.ToString("HH:mm:ss")
+                    });
+
+                    if (packages.Count == 0)
+                    {
+                        error = (output ?? "").StartsWith("Error:") ? output : "winget returned no installed packages.";
+                    }
+
+                    // Updatable packages first: they need release dates, so they are the slow ones
+                    var ordered = new List<Dictionary<string, string>>();
+                    foreach (var p in packages)
+                    {
+                        if (p.ContainsKey("available") && !string.IsNullOrWhiteSpace(p["available"])) ordered.Add(p);
+                    }
+                    foreach (var p in packages)
+                    {
+                        if (!(p.ContainsKey("available") && !string.IsNullOrWhiteSpace(p["available"]))) ordered.Add(p);
+                    }
+
+                    int total = ordered.Count;
+                    int done = 0;
+                    Action<Dictionary<string, string>> onItem = p =>
+                    {
+                        int n = Interlocked.Increment(ref done);
+                        SendScanProgress(
+                            "Resolving package details",
+                            n,
+                            total,
+                            p.ContainsKey("id") ? p["id"] : "",
+                            p.ContainsKey("name") ? p["name"] : ""
+                        );
+                    };
+
+                    var work = Task.Run(() => ResolvePackageMetadata(ordered, onItem));
+                    work.ContinueWith(t => SaveMetaCache());
+
+                    // Splash only waits a bounded time; stragglers keep filling in behind the live UI
+                    if (startup && ordered.Count > 0) work.Wait(20000);
+                    startup = false;
                 }
-
-                // Updatable packages first: they need release dates, so they are the slow ones
-                var ordered = new List<Dictionary<string, string>>();
-                foreach (var p in packages)
-                {
-                    if (p.ContainsKey("available") && !string.IsNullOrWhiteSpace(p["available"])) ordered.Add(p);
-                }
-                foreach (var p in packages)
-                {
-                    if (!(p.ContainsKey("available") && !string.IsNullOrWhiteSpace(p["available"]))) ordered.Add(p);
-                }
-
-                int total = ordered.Count;
-                int done = 0;
-                Action<Dictionary<string, string>> onItem = p =>
-                {
-                    int n = Interlocked.Increment(ref done);
-                    SendScanProgress(
-                        "Resolving package details",
-                        n,
-                        total,
-                        p.ContainsKey("id") ? p["id"] : "",
-                        p.ContainsKey("name") ? p["name"] : ""
-                    );
-                };
-
-                var work = Task.Run(() => ResolvePackageMetadata(ordered, onItem));
-                work.ContinueWith(t => SaveMetaCache());
-
-                // Splash only waits a bounded time; stragglers keep filling in behind the live UI
-                if (startup && ordered.Count > 0) work.Wait(20000);
+                while (Interlocked.CompareExchange(ref scanPending, 0, 1) == 1);
             }
             catch (Exception ex)
             {
@@ -879,7 +898,7 @@ namespace WingetBabyUI
             if (string.IsNullOrEmpty(id) || !id.Contains(".")) return false;
 
             string pub = NormToken(id.Substring(0, id.IndexOf('.')));
-            if (pub.Length < 3) return false;
+            if (pub.Length < 2) return false;
 
             // GitHub's own packages point at github.com, which the shared-host filter below would skip
             if (pub == "github")
@@ -891,7 +910,7 @@ namespace WingetBabyUI
                         (gu.Host == "github.com" || gu.Host == "www.github.com") &&
                         gu.AbsolutePath.StartsWith("/features")) return true;
                     if (Uri.TryCreate((u ?? "").Trim(), UriKind.Absolute, out gu) &&
-                        (gu.Host == "desktop.github.com" || gu.AbsolutePath.StartsWith("/apps/desktop"))) return true;
+                        (gu.Host == "desktop.github.com" || gu.Host == "cli.github.com" || gu.AbsolutePath.StartsWith("/apps/desktop"))) return true;
                 }
             }
 
@@ -982,7 +1001,7 @@ namespace WingetBabyUI
                           string.IsNullOrEmpty(installerUrl) && string.IsNullOrEmpty(rawIconUrl);
             if ((needReleaseDate && string.IsNullOrEmpty(releaseDate)) || noUrls)
             {
-                string safeId = id.Replace("\"", "");
+                string safeId = SanitizeWingetArg(id);
                 string output;
                 wingetShowGate.Wait();  // winget show is heavy; cap concurrent runs
                 try
@@ -1159,10 +1178,24 @@ namespace WingetBabyUI
             }
         }
 
+        private static string SanitizeWingetArg(string val)
+        {
+            if (string.IsNullOrEmpty(val)) return "";
+            string s = val.Replace("\"", "").Replace("'", "").Replace("\r", "").Replace("\n", "").Trim();
+            // Trailing backslashes escape the closing quote in CommandLineToArgvW
+            return s.TrimEnd('\\');
+        }
+
         private string UnquoteYaml(string val)
         {
             if (string.IsNullOrWhiteSpace(val)) return "";
-            return val.Trim().Trim('\'', '"');
+            string s = val.Trim();
+            if (!s.StartsWith("'") && !s.StartsWith("\""))
+            {
+                int commentIdx = s.IndexOf(" #", StringComparison.Ordinal);
+                if (commentIdx >= 0) s = s.Substring(0, commentIdx).Trim();
+            }
+            return s.Trim('\'', '"');
         }
 
         private string TryExtractGitHubOwner(string url)
@@ -1240,21 +1273,22 @@ namespace WingetBabyUI
             }
         }
 
-        private void HandleSearchWinget(string query)
+        private void HandleSearchWinget(string query, int seq)
         {
             if (string.IsNullOrWhiteSpace(query))
             {
-                SendToUi(new { type = "search_results", results = new object[0], query = "" });
+                SendToUi(new { type = "search_results", results = new object[0], query = "", seq = seq });
                 return;
             }
-            string safeQuery = query.Replace("\"", "");
+            string safeQuery = SanitizeWingetArg(query);
             string output = RunWingetCapture("search \"" + safeQuery + "\" -n 40 --accept-source-agreements --disable-interactivity");
             var results = ParseWingetTable(output);
             SendToUi(new
             {
                 type = "search_results",
                 results = results,
-                query = query
+                query = query,
+                seq = seq
             });
 
             if (results.Count > 0)
@@ -1262,7 +1296,7 @@ namespace WingetBabyUI
                 ResolvePackageMetadata(results, null);
             }
             // Trust scores are in; the UI can now sort/filter without rows jumping around mid-load
-            SendToUi(new { type = "search_complete", query = query });
+            SendToUi(new { type = "search_complete", query = query, seq = seq });
         }
 
         private void HandleGetPackageDetails(string id, string fallbackName, string fallbackSource)
@@ -1273,7 +1307,7 @@ namespace WingetBabyUI
             Dictionary<string, string> details;
             if (!detailsCache.TryGetValue(cleanId, out details))
             {
-                string safeId = cleanId.Replace("\"", "");
+                string safeId = SanitizeWingetArg(cleanId);
                 string output = RunWingetCapture("show -e --id \"" + safeId + "\" --accept-source-agreements --disable-interactivity");
                 details = ParseWingetShow(output);
                 if (!details.ContainsKey("Id") || string.IsNullOrWhiteSpace(details["Id"]))
@@ -1466,10 +1500,6 @@ namespace WingetBabyUI
                         d[subKey] = subVal;
                     }
                 }
-                else if (currentKey == "Description" && currentLines.Count < 10)
-                {
-                    currentLines.Add(line.Trim());
-                }
                 else if (currentKey == "License" && currentLines.Count < 3)
                 {
                     currentLines.Add(line.Trim());
@@ -1481,7 +1511,7 @@ namespace WingetBabyUI
 
         private void HandleRunWingetTask(string taskId, string operation, string packageId, string packageName, bool silent)
         {
-            string safeId = packageId.Replace("\"", "").Replace("'", "");
+            string safeId = SanitizeWingetArg(packageId);
             string args;
 
             if (operation == "install")
@@ -1505,6 +1535,7 @@ namespace WingetBabyUI
                 return;
             }
 
+            activeTaskCancelled = false;
             SendToUi(new
             {
                 type = "task_started",
@@ -1516,6 +1547,7 @@ namespace WingetBabyUI
             });
 
             int exitCode = -1;
+            Process proc = null;
             try
             {
                 var psi = new ProcessStartInfo
@@ -1530,33 +1562,34 @@ namespace WingetBabyUI
                     StandardErrorEncoding = Encoding.UTF8
                 };
 
-                using (var proc = new Process { StartInfo = psi })
+                proc = new Process { StartInfo = psi };
+                lock (procLock)
                 {
-                    lock (procLock)
-                    {
-                        activeProcess = proc;
-                    }
-
-                    proc.Start();
-
-                    // Stream stdout and stderr cleanly
-                    Task outReader = Task.Run(() => StreamReaderLoop(proc.StandardOutput, taskId, packageId));
-                    Task errReader = Task.Run(() => StreamReaderLoop(proc.StandardError, taskId, packageId));
-
-                    proc.WaitForExit();
-                    Task.WaitAll(new[] { outReader, errReader }, 2000);
-                    exitCode = proc.ExitCode;
+                    activeProcess = proc;
                 }
+
+                proc.Start();
+
+                // Stream stdout and stderr cleanly
+                Task outReader = Task.Run(() => StreamReaderLoop(proc.StandardOutput, taskId, packageId));
+                Task errReader = Task.Run(() => StreamReaderLoop(proc.StandardError, taskId, packageId));
+
+                proc.WaitForExit();
+                Task.WaitAll(new[] { outReader, errReader }, 2000);
+                exitCode = proc.ExitCode;
             }
             catch (Exception ex)
             {
-                SendToUi(new
+                if (!activeTaskCancelled)
                 {
-                    type = "task_log",
-                    taskId = taskId,
-                    packageId = packageId,
-                    line = "Error: " + ex.Message
-                });
+                    SendToUi(new
+                    {
+                        type = "task_log",
+                        taskId = taskId,
+                        packageId = packageId,
+                        line = "Error: " + ex.Message
+                    });
+                }
             }
             finally
             {
@@ -1564,7 +1597,17 @@ namespace WingetBabyUI
                 {
                     activeProcess = null;
                 }
+                if (proc != null)
+                {
+                    try { proc.Dispose(); } catch { }
+                }
             }
+
+            Dictionary<string, string> removed;
+            detailsCache.TryRemove(packageId, out removed);
+
+            // cancel_task already emitted task_cancelled; don't emit a conflicting task_done
+            if (activeTaskCancelled) return;
 
             // "No applicable update" / "already installed" are no-ops, not failures
             bool skipped = (exitCode == WINGET_UPDATE_NOT_APPLICABLE || exitCode == WINGET_ALREADY_INSTALLED);
@@ -1639,14 +1682,16 @@ namespace WingetBabyUI
                         if (!activeProcess.HasExited)
                         {
                             // winget spawns the real installer as a child; Kill() alone would orphan it
-                            var killer = Process.Start(new ProcessStartInfo
+                            using (var killer = Process.Start(new ProcessStartInfo
                             {
                                 FileName = "taskkill",
                                 Arguments = "/PID " + activeProcess.Id + " /T /F",
                                 UseShellExecute = false,
                                 CreateNoWindow = true
-                            });
-                            if (killer != null) killer.WaitForExit(3000);
+                            }))
+                            {
+                                if (killer != null) killer.WaitForExit(3000);
+                            }
                             if (!activeProcess.HasExited) activeProcess.Kill();
                         }
                     }
@@ -1683,8 +1728,14 @@ namespace WingetBabyUI
                     {
                         try { proc.Kill(); } catch { }
                     }
-                    outTask.Wait(3000);
-                    return outTask.IsCompleted ? outTask.Result : "";
+                    Task.WaitAll(new[] { outTask, errTask }, 3000);
+                    string outStr = outTask.IsCompleted ? outTask.Result : "";
+                    string errStr = errTask.IsCompleted ? errTask.Result : "";
+                    if (string.IsNullOrWhiteSpace(outStr) && !string.IsNullOrWhiteSpace(errStr))
+                    {
+                        return "Error: " + errStr.Trim();
+                    }
+                    return outStr;
                 }
             }
             catch (Exception ex)
@@ -1710,14 +1761,22 @@ namespace WingetBabyUI
                 string line = lines[i];
                 headerIdx = i;
 
-                // English headers: locate columns by name. Strip leading spinner artifacts first.
+                // English headers: locate columns by name. Strip leading spinner artifacts first,
+                // then add the stripped offset back so indices align with unstripped data rows.
                 int namePos = line.IndexOf("Name", StringComparison.Ordinal);
-                string cleanHeader = namePos >= 0 ? line.Substring(namePos) : line.TrimStart();
+                int offset = namePos >= 0 ? namePos : (line.Length - line.TrimStart().Length);
+                string cleanHeader = line.Substring(offset);
                 idStart = cleanHeader.IndexOf("Id", StringComparison.Ordinal);
                 verStart = cleanHeader.IndexOf("Version", StringComparison.Ordinal);
                 availStart = cleanHeader.IndexOf("Available", StringComparison.Ordinal);
                 srcStart = cleanHeader.IndexOf("Source", StringComparison.Ordinal);
                 matchStart = cleanHeader.IndexOf("Match", StringComparison.Ordinal);
+
+                if (idStart >= 0) idStart += offset;
+                if (verStart >= 0) verStart += offset;
+                if (availStart >= 0) availStart += offset;
+                if (srcStart >= 0) srcStart += offset;
+                if (matchStart >= 0) matchStart += offset;
 
                 if (idStart < 0 || verStart < 0)
                 {
@@ -1727,18 +1786,18 @@ namespace WingetBabyUI
                     var cols = Regex.Matches(cleanHeader, @"\S+(?: \S+)*");
                     if (cols.Count >= 3)
                     {
-                        idStart = cols[1].Index;
-                        verStart = cols[2].Index;
+                        idStart = cols[1].Index + offset;
+                        verStart = cols[2].Index + offset;
                         if (cols.Count >= 5)
                         {
-                            availStart = cols[3].Index;
-                            srcStart = cols[4].Index;
+                            availStart = cols[3].Index + offset;
+                            srcStart = cols[4].Index + offset;
                         }
                         else if (cols.Count == 4)
                         {
                             // 4th column is Source if the first data row ends in a known source name
                             string sample = i + 2 < lines.Length ? lines[i + 2] : "";
-                            int c = cols[3].Index;
+                            int c = cols[3].Index + offset;
                             string tail = c < sample.Length ? sample.Substring(c).Trim() : "";
                             if (tail == "winget" || tail == "msstore") srcStart = c;
                             else availStart = c;

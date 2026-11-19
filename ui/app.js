@@ -15,7 +15,8 @@
     isScanning: false,
     wingetOnlyFilter: true,
     trustedOnly: true,      // search: hide community (unverified-publisher) packages
-    searchPending: false    // true until the host has scored every search result
+    searchPending: false,   // true until the host has scored every search result
+    searchSeq: 0
   };
 
   const KNOWN_ICONS = {
@@ -120,6 +121,10 @@
     "discord.discord": "Voice, video, and text communication platform"
   };
 
+  function isHttpUrl(url) {
+    return typeof url === "string" && /^https?:\/\//i.test(url.trim());
+  }
+
   function resolveIconSources(item) {
     if (!item) return { primary: "", fallback: "", local: "" };
     const idLower = (item.id || "").toLowerCase();
@@ -131,10 +136,10 @@
     }
 
     const meta = state.metaMap.get(idLower);
-    if (meta && meta.iconUrl) {
+    if (meta && isHttpUrl(meta.iconUrl)) {
       return {
         primary: meta.iconUrl,
-        fallback: meta.fallbackIconUrl || "",
+        fallback: isHttpUrl(meta.fallbackIconUrl) ? meta.fallbackIconUrl : "",
         local: localIcon
       };
     }
@@ -650,15 +655,6 @@
       });
     });
 
-    container.querySelectorAll(".pkg-id").forEach((el) => {
-      el.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const id = el.getAttribute("data-copy");
-        navigator.clipboard.writeText(id);
-        showToast(`Copied ID: ${id}`);
-      });
-    });
-
     container.querySelectorAll("[data-action]").forEach((btn) => {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -679,9 +675,14 @@
   function renderPresetCard(app, catId) {
     const info = findInstalledInfo(app);
     const isSelected = state.selectedIds.has(app.id);
+    const candidateIds = new Set([app.id.toLowerCase()]);
+    if (info && info.id) candidateIds.add(info.id.toLowerCase());
+    if (Array.isArray(app.altIds)) {
+      app.altIds.forEach((a) => candidateIds.add(a.toLowerCase()));
+    }
     const isBusy =
-      (state.currentTask && state.currentTask.packageId.toLowerCase() === app.id.toLowerCase()) ||
-      state.taskQueue.some((t) => t.packageId.toLowerCase() === app.id.toLowerCase());
+      (state.currentTask && candidateIds.has(state.currentTask.packageId.toLowerCase())) ||
+      state.taskQueue.some((t) => candidateIds.has(t.packageId.toLowerCase()));
 
     let statusHtml = "";
     let actionBtns = "";
@@ -689,8 +690,6 @@
     if (isBusy) {
       statusHtml = `<span class="status-pill status-busy">Working...</span>`;
     } else if (info && info.available) {
-      const meta = state.metaMap.get(info.id.toLowerCase());
-      const dateSuffix = meta && meta.releaseDate ? ` • ${meta.releaseDate}` : "";
       statusHtml = ""; // the Update button already says it; version details live in the Updates tab
       actionBtns = `
         <button class="btn btn-amber btn-sm" data-action="upgrade" data-id="${escapeHtml(info.id)}" data-name="${escapeHtml(app.name)}">Update</button>
@@ -877,14 +876,16 @@
                 }
               </td>
               <td><span class="status-pill status-missing">${escapeHtml(p.source || "system")}</span></td>
-              <td style="text-align:right; display:flex; gap:6px; justify-content:flex-end">
-                ${
-                  p.available
-                    ? `<button class="btn btn-amber btn-sm" data-table-op="upgrade" data-id="${escapeHtml(p.id)}" data-name="${escapeHtml(p.name)}">Update</button>`
-                    : ""
-                }
-                <button class="btn btn-ghost btn-sm" data-pin-id="${escapeHtml(p.id)}" data-pin-name="${escapeHtml(p.name)}" title="Save to My Presets">+ Preset</button>
-                <button class="btn btn-danger-outline btn-sm" data-table-op="uninstall" data-id="${escapeHtml(p.id)}" data-name="${escapeHtml(p.name)}">Uninstall</button>
+              <td style="text-align:right">
+                <div class="table-actions">
+                  ${
+                    p.available
+                      ? `<button class="btn btn-amber btn-sm" data-table-op="upgrade" data-id="${escapeHtml(p.id)}" data-name="${escapeHtml(p.name)}">Update</button>`
+                      : ""
+                  }
+                  <button class="btn btn-ghost btn-sm" data-pin-id="${escapeHtml(p.id)}" data-pin-name="${escapeHtml(p.name)}" title="Save to My Presets">+ Preset</button>
+                  <button class="btn btn-danger-outline btn-sm" data-table-op="uninstall" data-id="${escapeHtml(p.id)}" data-name="${escapeHtml(p.name)}">Uninstall</button>
+                </div>
               </td>
             </tr>
           `
@@ -951,9 +952,15 @@
       const info = state.installedMap.get(id.toLowerCase());
       instPill.className = "status-pill status-installed";
       instPill.textContent = `Installed (${info.version || "Current"})`;
-      actionBtn.className = "btn btn-danger-outline";
-      actionBtn.textContent = "Uninstall";
-      actionBtn.setAttribute("data-table-op", "uninstall");
+      if (info && info.available) {
+        actionBtn.className = "btn btn-amber";
+        actionBtn.textContent = `Update to ${info.available}`;
+        actionBtn.setAttribute("data-table-op", "upgrade");
+      } else {
+        actionBtn.className = "btn btn-danger-outline";
+        actionBtn.textContent = "Uninstall";
+        actionBtn.setAttribute("data-table-op", "uninstall");
+      }
       actionBtn.setAttribute("data-id", id);
       actionBtn.setAttribute("data-name", fallbackName || id);
     } else {
@@ -1094,16 +1101,18 @@
                   <td><span class="pkg-id" data-copy="${escapeHtml(r.id)}" title="Click to copy ID">${escapeHtml(r.id)}</span></td>
                   <td>${versionDisplay}</td>
                   <td>${sourceBadge}</td>
-                  <td style="text-align:right; display:flex; gap:6px; justify-content:flex-end; align-items:center;">
-                    <button class="btn btn-ghost btn-sm btn-inspect" data-inspect-id="${escapeHtml(r.id)}" data-inspect-name="${escapeHtml(r.name)}" data-inspect-source="${escapeHtml(r.source || "winget")}" title="Inspect full package authenticity & details">
-                      Details
-                    </button>
-                    <button class="btn btn-ghost btn-sm" data-pin-id="${escapeHtml(r.id)}" data-pin-name="${escapeHtml(r.name)}">+ Presets</button>
-                    ${
-                      isInst
-                        ? `<span class="status-pill status-installed">Installed</span>`
-                        : `<button class="btn btn-primary btn-sm" data-table-op="install" data-id="${escapeHtml(r.id)}" data-name="${escapeHtml(r.name)}">Install</button>`
-                    }
+                  <td style="text-align:right">
+                    <div class="table-actions">
+                      <button class="btn btn-ghost btn-sm btn-inspect" data-inspect-id="${escapeHtml(r.id)}" data-inspect-name="${escapeHtml(r.name)}" data-inspect-source="${escapeHtml(r.source || "winget")}" title="Inspect full package authenticity & details">
+                        Details
+                      </button>
+                      <button class="btn btn-ghost btn-sm" data-pin-id="${escapeHtml(r.id)}" data-pin-name="${escapeHtml(r.name)}">+ Presets</button>
+                      ${
+                        isInst
+                          ? `<span class="status-pill status-installed">Installed</span>`
+                          : `<button class="btn btn-primary btn-sm" data-table-op="install" data-id="${escapeHtml(r.id)}" data-name="${escapeHtml(r.name)}">Install</button>`
+                      }
+                    </div>
                   </td>
                 </tr>
               `;
@@ -1151,22 +1160,6 @@
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         openAddPresetModal(btn.getAttribute("data-pin-name"), btn.getAttribute("data-pin-id"));
-      });
-    });
-
-    container.querySelectorAll("[data-open-url]").forEach((el) => {
-      el.addEventListener("click", (e) => {
-        e.stopPropagation();
-        sendHost({ action: "open_url", url: el.getAttribute("data-open-url") });
-      });
-    });
-
-    container.querySelectorAll(".pkg-id").forEach((el) => {
-      el.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const id = el.getAttribute("data-copy");
-        navigator.clipboard.writeText(id);
-        showToast(`Copied ID: ${id}`);
       });
     });
   }
@@ -1217,13 +1210,26 @@
     return lines.join("\r\n").trim() + "\r\n";
   }
 
+  function copyToClipboard(text, toastMessage) {
+    if (!text) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard
+        .writeText(text)
+        .then(() => showToast(toastMessage || `Copied: ${text}`))
+        .catch(() => showToast("Failed to copy to clipboard"));
+    } else {
+      showToast("Clipboard unavailable");
+    }
+  }
+
   function escapeHtml(str) {
     if (str == null) return "";
     return String(str)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   // Event Listeners Setup
@@ -1320,6 +1326,9 @@
     });
 
     document.getElementById("btn-batch-uninstall").addEventListener("click", () => {
+      const count = state.selectedIds.size;
+      if (count === 0) return;
+      if (!confirm(`Uninstall ${count} selected package${count === 1 ? "" : "s"}?`)) return;
       for (const id of state.selectedIds) {
         const app = findPresetAppById(id);
         const info = findInstalledInfo(app);
@@ -1364,8 +1373,12 @@
       e.preventDefault();
       const q = document.getElementById("input-repo-search").value.trim();
       if (!q) return;
+      state.searchSeq++;
+      state.searchPending = true;
+      const note = document.getElementById("search-trust-note");
+      if (note) note.textContent = "";
       document.getElementById("search-table-wrap").innerHTML = `<div class="empty-state">Searching Winget catalog for "${escapeHtml(q)}"...</div>`;
-      sendHost({ action: "search_winget", query: q });
+      sendHost({ action: "search_winget", query: q, seq: state.searchSeq });
     });
 
     document.getElementById("btn-refresh").addEventListener("click", () => {
@@ -1428,25 +1441,37 @@
         description = KNOWN_DESCRIPTIONS[id.toLowerCase()] || "";
       }
 
-      const cat = (state.presets.categories || []).find((c) => c.id === catId);
-      if (cat) {
-        if (!cat.apps.some((a) => a.id.toLowerCase() === id.toLowerCase())) {
+      const existingCat = (state.presets.categories || []).find((c) =>
+        (c.apps || []).some((a) => a.id.toLowerCase() === id.toLowerCase())
+      );
+      if (existingCat) {
+        showToast(`${name} is already in ${existingCat.name}`);
+      } else {
+        const cat = (state.presets.categories || []).find((c) => c.id === catId);
+        if (cat) {
           cat.apps.push({ name, id, description });
           sendHost({ action: "save_presets", data: state.presets });
           renderPresets();
           showToast(`Added ${name} to ${cat.name}`);
-        } else {
-          showToast(`${name} is already in ${cat.name}`);
         }
       }
       document.getElementById("modal-add-preset").classList.add("hidden");
     });
 
-    document.getElementById("btn-toggle-console").addEventListener("click", (e) => {
-      e.stopPropagation();
+    function toggleConsoleDrawer() {
       const body = document.getElementById("console-body");
       const isHidden = body.classList.toggle("hidden");
       document.getElementById("console-toggle-label").textContent = isHidden ? "Terminal ▲" : "Terminal ▼";
+    }
+
+    document.getElementById("console-bar").addEventListener("click", (e) => {
+      if (e.target.closest("button")) return;
+      toggleConsoleDrawer();
+    });
+
+    document.getElementById("btn-toggle-console").addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleConsoleDrawer();
     });
 
     document.getElementById("btn-clear-log").addEventListener("click", (e) => {
@@ -1501,8 +1526,7 @@
         e.stopPropagation();
         const val = copyEl.getAttribute("data-copy");
         if (val) {
-          navigator.clipboard.writeText(val);
-          showToast(`Copied: ${val}`);
+          copyToClipboard(val, `Copied: ${val}`);
         }
       }
     });
@@ -1530,6 +1554,7 @@
             state.isScanning = false;
             document.querySelector(".icon-spin-target").classList.remove("spinning");
             state.installedList = msg.packages || [];
+            state.updatesList = []; // clear stale Deep Scan cache so updated packages drop off immediately
             state.installedMap.clear();
             for (const p of state.installedList) {
               if (p.id) state.installedMap.set(p.id.toLowerCase(), p);
@@ -1577,9 +1602,12 @@
             break;
 
           case "search_results":
+            if (typeof msg.seq === "number" && msg.seq !== state.searchSeq) break;
             state.searchResults = msg.results || [];
             state.searchPending = state.searchResults.length > 0;
             if (state.searchResults.length === 0) {
+              const note = document.getElementById("search-trust-note");
+              if (note) note.textContent = "";
               document.getElementById("search-table-wrap").innerHTML = `<div class="empty-state">No packages found matching "${escapeHtml(msg.query)}".</div>`;
             } else {
               renderSearch();
@@ -1587,6 +1615,7 @@
             break;
 
           case "search_complete":
+            if (typeof msg.seq === "number" && msg.seq !== state.searchSeq) break;
             state.searchPending = false;
             renderSearch();
             break;
@@ -1703,8 +1732,21 @@
 
               // Icon
               const iconWrap = document.getElementById("detail-icon-wrap");
-              if (msg.iconUrl) {
-                iconWrap.innerHTML = `<img class="app-icon-img" src="${escapeHtml(msg.iconUrl)}" alt="" onerror="this.onerror=null; this.src='${escapeHtml(msg.fallbackIconUrl || "")}'" />`;
+              const detailIconUrl = isHttpUrl(msg.iconUrl) ? msg.iconUrl : "";
+              const detailFallbackUrl = isHttpUrl(msg.fallbackIconUrl) ? msg.fallbackIconUrl : "";
+              if (detailIconUrl) {
+                const installedInfo = state.installedMap.get(msg.id.toLowerCase());
+                const localIcon = (installedInfo && installedInfo.localIcon) || "";
+                const initials = escapeHtml(getInitials(msg.name || msg.id));
+                iconWrap.innerHTML = `
+                  <img class="app-icon-img" src="${escapeHtml(detailIconUrl)}"
+                       ${detailFallbackUrl ? `data-fallback="${escapeHtml(detailFallbackUrl)}"` : ""}
+                       ${localIcon ? `data-local="${escapeHtml(localIcon)}"` : ""}
+                       alt=""
+                       onload="window.onAppIconLoad(this)"
+                       onerror="window.onAppIconError(this)" />
+                  <span class="app-icon-fallback" style="display:none">${initials}</span>
+                `;
               } else {
                 iconWrap.innerHTML = renderAppIcon({ id: msg.id, name: msg.name, domain: msg.homepage || msg.publisherUrl || "" }, false);
               }
