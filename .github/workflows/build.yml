@@ -1,0 +1,30 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Winget Baby portable package
+        shell: powershell
+        run: |
+          .\build.ps1
+          if (-not (Test-Path ".\WingetUI.exe")) { throw "WingetUI.exe was not produced" }
+          if (-not (Test-Path ".\dist\WingetBaby-portable.zip")) { throw "Portable zip was not produced" }
+
+      - name: Upload portable package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WingetBaby-portable
+          path: dist/WingetBaby-portable.zip
+          if-no-files-found: error
