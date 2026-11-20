@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-"Winget Baby": a Windows desktop GUI for `winget` (install/upgrade/uninstall, search, update checks, curated presets). It's a single-file C# WinForms host (`WingetUI.cs`) that embeds WebView2 and serves a vanilla HTML/CSS/JS frontend from `ui/`. No git repo, no package manager, no test suite, no linter.
+"WingetUI": a Windows desktop GUI for `winget` (install/upgrade/uninstall, search, update checks, curated presets). It's a single-file C# WinForms host (`WingetUI.cs`) that embeds WebView2 and serves a vanilla HTML/CSS/JS frontend from `ui/`. No git repo, no package manager, no test suite, no linter.
 
 ## Build & run
 
@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `build.ps1` uses the in-box .NET Framework compiler `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`. **That compiler only supports C# 5**: no string interpolation (`$"..."`), no `?.`/`??=`, no `nameof`, no expression-bodied members, no `out var`, no tuples. Use `string.Format` and explicit null checks, matching existing code.
 - If the three WebView2 DLLs are missing, `build.ps1` downloads the `Microsoft.Web.WebView2` NuGet package and extracts them. They must sit next to `WingetUI.exe`, as must `ui/` and `presets.json` (paths resolve from `AppDomain.CurrentDomain.BaseDirectory`).
-- `build.ps1` also assembles the portable package: `dist\WingetBaby\` + `dist\WingetBaby-portable.zip`. All mutable state (presets, `meta-cache.json`, WebView2 profile, `winget.txt`) lives in `Data\` next to the exe (falls back to `%LOCALAPPDATA%\WingetBaby` if read-only); root `presets.json` is only a first-run seed.
+- `build.ps1` also assembles the portable package: `dist\WingetUI\` + `dist\WingetUI-portable.zip`. All mutable state (presets, `meta-cache.json`, WebView2 profile, `winget.txt`) lives in `Data\` next to the exe (falls back to `%LOCALAPPDATA%\WingetUI` if read-only); root `presets.json` is only a first-run seed.
 - Frontend changes (`ui/*`) need no recompile, just restart the app. Launch with `--devtools` to enable F12/DevTools; they're off otherwise.
 - `test_*.png` in the root are leftover screenshots, not test fixtures.
 

@@ -15,16 +15,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build Winget Baby portable package
+      - name: Build WingetUI portable package
         shell: powershell
         run: |
           .\build.ps1
           if (-not (Test-Path ".\WingetUI.exe")) { throw "WingetUI.exe was not produced" }
-          if (-not (Test-Path ".\dist\WingetBaby-portable.zip")) { throw "Portable zip was not produced" }
+          if (-not (Test-Path ".\dist\WingetUI-portable.zip")) { throw "Portable zip was not produced" }
 
       - name: Upload portable package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WingetBaby-portable
-          path: dist/WingetBaby-portable.zip
+          name: WingetUI-portable
+          path: dist/WingetUI-portable.zip
           if-no-files-found: error

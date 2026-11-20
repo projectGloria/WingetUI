@@ -56,12 +56,12 @@ jobs:
             WebView2Loader.dll
           key: webview2-windows-x64-${{ hashFiles('build.ps1') }}
 
-      - name: Build Winget Baby
+      - name: Build WingetUI
         shell: powershell
         run: |
           .\build.ps1
-          if (-not (Test-Path ".\dist\WingetBaby\WingetUI.exe")) {
-            throw "Expected build output dist\WingetBaby\WingetUI.exe was not produced"
+          if (-not (Test-Path ".\dist\WingetUI\WingetUI.exe")) {
+            throw "Expected build output dist\WingetUI\WingetUI.exe was not produced"
           }
 
       - name: Build Windows installer (Inno Setup)
@@ -89,16 +89,16 @@ jobs:
           }
 
           New-Item -ItemType Directory -Path ".\installers" -Force | Out-Null
-          $sourceDir = (Resolve-Path ".\dist\WingetBaby").Path
+          $sourceDir = (Resolve-Path ".\dist\WingetUI").Path
           $outputDir = (Resolve-Path ".\installers").Path
-          $baseName = "WingetBaby-$($env:APP_VERSION)-windows-x64"
+          $baseName = "WingetUI-$($env:APP_VERSION)-windows-x64"
 
           & $iscc `
             "/DAppVersion=$($env:APP_VERSION)" `
             "/DSourceDir=$sourceDir" `
             "/DOutputDir=$outputDir" `
             "/DOutputBaseFilename=$baseName" `
-            ".\installer\WingetBaby.iss"
+            ".\installer\WingetUI.iss"
 
           if ($LASTEXITCODE -ne 0) {
             throw "Inno Setup compilation failed with exit code $LASTEXITCODE"

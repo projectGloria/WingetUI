@@ -6,6 +6,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Net;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -17,7 +18,15 @@ using Microsoft.Win32;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
-namespace WingetBabyUI
+[assembly: AssemblyTitle("WingetUI")]
+[assembly: AssemblyProduct("WingetUI")]
+[assembly: AssemblyDescription("Package & Preset Manager for winget")]
+[assembly: AssemblyCompany("projectGloria")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyInformationalVersion("1.1.0")]
+
+namespace WingetUI
 {
     public class MainForm : Form
     {
@@ -93,7 +102,7 @@ namespace WingetBabyUI
             SeedPresets();
             LoadMetaCache();
 
-            this.Text = "Winget Baby — Package & Preset Manager";
+            this.Text = "WingetUI — Package & Preset Manager";
             this.FormBorderStyle = FormBorderStyle.None;
             this.Size = new Size(1260, 840);
             this.MinimumSize = new Size(920, 620);
@@ -149,8 +158,11 @@ namespace WingetBabyUI
             }
             catch { }
 
-            string fallback = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WingetBaby");
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string fallback = Path.Combine(localAppData, "WingetUI");
+            // Keep using the pre-rename folder if it exists so existing presets/cache aren't lost
+            string legacy = Path.Combine(localAppData, "WingetBaby");
+            if (!Directory.Exists(fallback) && Directory.Exists(legacy)) return legacy;
             Directory.CreateDirectory(fallback);
             return fallback;
         }
@@ -302,7 +314,7 @@ namespace WingetBabyUI
             {
                 MessageBox.Show(
                     "Failed to initialize WebView2 runtime:\n" + ex.Message,
-                    "Winget Baby Error",
+                    "WingetUI Error",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error
                 );
@@ -1123,7 +1135,7 @@ namespace WingetBabyUI
                 req.Method = "GET";
                 req.Timeout = timeoutMs;
                 req.ReadWriteTimeout = timeoutMs;
-                req.UserAgent = "WingetBabyUI/1.0";
+                req.UserAgent = "WingetUI/1.1.0";
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 using (var reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
                 {
@@ -1893,13 +1905,13 @@ namespace WingetBabyUI
 
             // One instance per folder: two copies would fight over Data\ (presets, cache, WebView2 profile)
             bool created;
-            string key = "WingetBabyUI_" + Regex.Replace(
+            string key = "WingetUI_" + Regex.Replace(
                 AppDomain.CurrentDomain.BaseDirectory.ToLowerInvariant(), "[^a-z0-9]", "_");
             using (var mutex = new Mutex(true, key, out created))
             {
                 if (!created)
                 {
-                    MessageBox.Show("Winget Baby is already running.", "Winget Baby",
+                    MessageBox.Show("WingetUI is already running.", "WingetUI",
                         MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }

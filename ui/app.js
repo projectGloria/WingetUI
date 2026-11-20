@@ -413,6 +413,7 @@
     if (msg.id) {
       // package_metadata for this id was posted just before this message, so state already has its icon
       const item = { id: msg.id, name: msg.name || msg.id };
+      document.getElementById("splash-current").classList.add("active");
       document.getElementById("splash-current-icon").innerHTML = renderAppIcon(item, false);
       document.getElementById("splash-current-name").textContent = item.name;
       document.getElementById("splash-current-id").textContent = item.id;

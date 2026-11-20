@@ -1,9 +1,9 @@
 #ifndef AppVersion
-  #define AppVersion "0.0.0"
+  #define AppVersion "1.1.0"
 #endif
 
 #ifndef SourceDir
-  #define SourceDir "..\dist\WingetBaby"
+  #define SourceDir "..\dist\WingetUI"
 #endif
 
 #ifndef OutputDir
@@ -11,20 +11,20 @@
 #endif
 
 #ifndef OutputBaseFilename
-  #define OutputBaseFilename "WingetBaby-" + AppVersion + "-windows-x64"
+  #define OutputBaseFilename "WingetUI-" + AppVersion + "-windows-x64"
 #endif
 
 [Setup]
 AppId={{7E3F2C4B-9D8A-4B61-A5E2-1F4C8B90D3E7}
-AppName=Winget Baby
+AppName=WingetUI
 AppVersion={#AppVersion}
-AppVerName=Winget Baby {#AppVersion}
+AppVerName=WingetUI {#AppVersion}
 AppPublisher=projectGloria
 AppPublisherURL=https://github.com/projectGloria/WingetUI
 AppSupportURL=https://github.com/projectGloria/WingetUI/issues
 AppUpdatesURL=https://github.com/projectGloria/WingetUI/releases
-DefaultDirName={autopf}\WingetBaby
-DefaultGroupName=Winget Baby
+DefaultDirName={autopf}\WingetUI
+DefaultGroupName=WingetUI
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
@@ -35,6 +35,7 @@ OutputBaseFilename={#OutputBaseFilename}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\WingetUI.ico
 UninstallDisplayIcon={app}\WingetUI.exe
 
 [Languages]
@@ -47,8 +48,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\Winget Baby"; Filename: "{app}\WingetUI.exe"
-Name: "{autodesktop}\Winget Baby"; Filename: "{app}\WingetUI.exe"; Tasks: desktopicon
+Name: "{autoprograms}\WingetUI"; Filename: "{app}\WingetUI.exe"
+Name: "{autodesktop}\WingetUI"; Filename: "{app}\WingetUI.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\WingetUI.exe"; Description: "{cm:LaunchProgram,Winget Baby}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\WingetUI.exe"; Description: "{cm:LaunchProgram,WingetUI}"; Flags: nowait postinstall skipifsilent

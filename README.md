@@ -1,6 +1,6 @@
 <div align="center">
-  <img src="docs/assets/icon.svg" alt="Winget Baby icon" width="96" height="96" />
-  <h1>Winget Baby</h1>
+  <img src="ui/assets/logo.png" alt="WingetUI icon" width="96" height="96" />
+  <h1>WingetUI</h1>
   <p>A fast, portable Windows desktop GUI for <code>winget</code> — manage curated app presets, batch installs, updates, and verified catalog searches.</p>
   <p>
     <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011%20(x64)-0078D6?style=flat-square" alt="Platform: Windows 10 / 11 (x64)" />
@@ -12,7 +12,7 @@
 </div>
 
 <p align="center">
-  <img src="docs/assets/presets.png" alt="Winget Baby My Presets screen showing categorized app cards, status badges, and quick-select controls" width="880" />
+  <img src="docs/assets/presets.png" alt="WingetUI My Presets screen showing categorized app cards, status badges, and quick-select controls" width="880" />
   <br /><em>My Presets: browse curated categories, see live install/update status, and batch-queue actions.</em>
 </p>
 
@@ -31,7 +31,7 @@
 
 ## About
 
-**Winget Baby** is a lightweight Windows desktop interface for the Windows Package Manager (`winget`). It pairs a single-file C# WinForms host ([WingetUI.cs](WingetUI.cs)) with an embedded Microsoft Edge WebView2 frontend ([ui/](ui/)) written in vanilla HTML, CSS, and JavaScript.
+**WingetUI** is a lightweight Windows desktop interface for the Windows Package Manager (`winget`). It pairs a single-file C# WinForms host ([WingetUI.cs](WingetUI.cs)) with an embedded Microsoft Edge WebView2 frontend ([ui/](ui/)) written in vanilla HTML, CSS, and JavaScript.
 
 It compiles directly with Windows' built-in .NET Framework compiler (`csc.exe`) with no Visual Studio, Node.js, or bundler required, and packages into a self-contained portable folder you can move between machines.
 
@@ -42,7 +42,7 @@ It compiles directly with Windows' built-in .NET Framework compiler (`csc.exe`) 
 - **Verified-Publisher Catalog Search**: Searches the official Winget repository (`winget search`), scores publisher authenticity against package domains and Microsoft Store certification, and filters out unverified community packages by default.
 - **Package Inspection & Integrity Verification**: Open any package's details modal to inspect its publisher, author, catalog source, license, installer type, download host, official URLs, and installer SHA-256 hash before installing.
 - **Live Terminal Drawer & Cancellable Tasks**: Runs mutating `winget` commands sequentially from a UI task queue, streams live output into a collapsible console drawer, and lets you cancel an active operation at any time.
-- **Portable Data & Markdown Export**: Keeps presets, a 7-day metadata cache (`meta-cache.json`), and the WebView2 profile inside a local `Data\` folder next to `WingetUI.exe` (falling back to `%LOCALAPPDATA%\WingetBaby` when read-only), and exports your preset list to `Data\winget.txt`.
+- **Portable Data & Markdown Export**: Keeps presets, a 7-day metadata cache (`meta-cache.json`), and the WebView2 profile inside a local `Data\` folder next to `WingetUI.exe` (falling back to `%LOCALAPPDATA%\WingetUI` when read-only), and exports your preset list to `Data\winget.txt`.
 
 ## Screenshots
 
@@ -69,7 +69,7 @@ flowchart LR
     Host -->|"list, upgrade, search,<br/>show, install, uninstall"| Winget["winget.exe CLI"]
     Host -->|"Fast manifest &amp; icon lookup"| GitHub["microsoft/winget-pkgs<br/>&amp; MS Store Catalog"]
     Host -->|"DisplayIcon extraction"| Reg["Windows Uninstall<br/>Registry"]
-    Host <-->|"presets.json, meta-cache.json,<br/>winget.txt, WebView2 profile"| Data["Data/ (Portable)<br/>or %LOCALAPPDATA%/WingetBaby"]
+    Host <-->|"presets.json, meta-cache.json,<br/>winget.txt, WebView2 profile"| Data["Data/ (Portable)<br/>or %LOCALAPPDATA%/WingetUI"]
 ```
 
 `WingetUI.cs` maps the local `ui/` directory to the virtual host `https://winget.app` inside WebView2 and exchanges JSON messages with `ui/app.js`. After listing installed packages via `winget`, the host asynchronously enriches icons and metadata in parallel—checking Windows Uninstall registry keys for local icons, pulling YAML manifests from `microsoft/winget-pkgs`, and falling back to `winget show` when needed—while caching results for 7 days in `Data\meta-cache.json`.
@@ -92,9 +92,9 @@ flowchart LR
    .\build.ps1
    ```
 
-2. Run `.\WingetUI.exe` directly, or copy `dist\WingetBaby\` (or extract `dist\WingetBaby-portable.zip`) to any folder and launch `WingetUI.exe`.
+2. Run `.\WingetUI.exe` directly, or copy `dist\WingetUI\` (or extract `dist\WingetUI-portable.zip`) to any folder and launch `WingetUI.exe`.
 
-On first launch, Winget Baby copies the seed [presets.json](presets.json) into `Data\presets.json` and scans your installed packages. All runtime state stays inside `Data\` next to the executable so the folder remains portable.
+On first launch, WingetUI copies the seed [presets.json](presets.json) into `Data\presets.json` and scans your installed packages. All runtime state stays inside `Data\` next to the executable so the folder remains portable.
 
 ## Usage
 
@@ -142,22 +142,22 @@ On first launch, Winget Baby copies the seed [presets.json](presets.json) into `
 | Artifact | Path | Description |
 | --- | --- | --- |
 | Executable | `WingetUI.exe` | Compiled x64 WinForms + WebView2 host |
-| Portable folder | `dist\WingetBaby\` | Self-contained folder with `WingetUI.exe`, WebView2 DLLs, `ui/`, and seed `presets.json` |
-| Portable archive | `dist\WingetBaby-portable.zip` | Zipped copy of `dist\WingetBaby\` |
+| Portable folder | `dist\WingetUI\` | Self-contained folder with `WingetUI.exe`, WebView2 DLLs, `ui/`, and seed `presets.json` |
+| Portable archive | `dist\WingetUI-portable.zip` | Zipped copy of `dist\WingetUI\` |
 
 > [!NOTE]
 > Frontend edits under `ui/` do not require recompiling `WingetUI.exe`—just restart the app.
 
 ## How to Release
 
-Pushing a version tag starting with `v` triggers the [Build Installers](.github/workflows/build-installers.yml) workflow on GitHub Actions, which compiles the Windows x64 Inno Setup installer (`WingetBaby-<version>-windows-x64.exe`), uploads it as the `installers` workflow artifact, and publishes a GitHub Release with the installer attached:
+Pushing a version tag starting with `v` triggers the [Build Installers](.github/workflows/build-installers.yml) workflow on GitHub Actions, which compiles the Windows x64 Inno Setup installer (`WingetUI-<version>-windows-x64.exe`), uploads it as the `installers` workflow artifact, and publishes a GitHub Release with the installer attached:
 
 ```bash
 git tag v1.0.0
 git push --tags
 ```
 
-- **Download released installers**: Go to the repository's [Releases](https://github.com/projectGloria/WingetUI/releases) page and download `WingetBaby-<version>-windows-x64.exe`.
+- **Download released installers**: Go to the repository's [Releases](https://github.com/projectGloria/WingetUI/releases) page and download `WingetUI-<version>-windows-x64.exe`.
 - **Manual test builds (without publishing a release)**: Open **Actions → Build Installers → Run workflow** on GitHub, optionally enter a version string, and download the `installers` artifact from the completed workflow run.
 
 ## Configuration
@@ -165,7 +165,7 @@ git push --tags
 <details>
 <summary><strong>Data directory layout &amp; <code>presets.json</code> schema</strong></summary>
 
-Mutable files are stored in `Data\` beside `WingetUI.exe` (or `%LOCALAPPDATA%\WingetBaby` if the app directory is read-only):
+Mutable files are stored in `Data\` beside `WingetUI.exe` (or `%LOCALAPPDATA%\WingetUI` if the app directory is read-only):
 
 - `Data\presets.json` — your active preset categories and apps (seeded from root [presets.json](presets.json) on first run)
 - `Data\meta-cache.json` — 7-day cache of resolved icons, release dates, URLs, and publisher trust scores

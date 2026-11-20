@@ -41,6 +41,7 @@ Write-Host "Compiling WingetUI.exe..." -ForegroundColor Cyan
 Get-Process -Name "WingetUI" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 & $csc /nologo /target:winexe /platform:x64 /optimize+ `
+    /win32icon:"$scriptDir\WingetUI.ico" `
     /out:"$scriptDir\WingetUI.exe" `
     /r:"System.dll" `
     /r:"System.Core.dll" `
@@ -56,8 +57,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "Build succeeded: $scriptDir\WingetUI.exe" -ForegroundColor Green
 
-# ---- Portable package: dist\WingetBaby\ (+ zip). Copy the folder anywhere; state lives in its Data\ subfolder.
-$dist = Join-Path $scriptDir "dist\WingetBaby"
+# ---- Portable package: dist\WingetUI\ (+ zip). Copy the folder anywhere; state lives in its Data\ subfolder.
+$dist = Join-Path $scriptDir "dist\WingetUI"
 if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 
@@ -66,7 +67,7 @@ Copy-Item $coreDll, $winFormsDll, $loaderDll $dist
 Copy-Item "$scriptDir\ui" (Join-Path $dist "ui") -Recurse
 Copy-Item "$scriptDir\presets.json" $dist   # seed only; the app copies it to Data\ on first run
 
-$zip = Join-Path $scriptDir "dist\WingetBaby-portable.zip"
+$zip = Join-Path $scriptDir "dist\WingetUI-portable.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path $dist -DestinationPath $zip
 Write-Host "Portable package: $dist" -ForegroundColor Green
