@@ -12,6 +12,8 @@
     selectedIds: new Set(),
     taskQueue: [],
     currentTask: null,
+    taskProgress: null,      // { phase, percent (-1 = indeterminate), detail } for currentTask
+    checkingUpdates: false,
     isScanning: false,
     wingetOnlyFilter: true,
     trustedOnly: true,      // search: hide community (unverified-publisher) packages
@@ -445,22 +447,217 @@
     }
   }
 
-  function showToast(msg) {
+  // kind: "info" | "success" | "warn" | "error". Problems stay up longer and can be dismissed.
+  function showToast(msg, kind = "info") {
     const container = document.getElementById("toast-container");
+    while (container.childElementCount >= 4) container.firstElementChild.remove();
     const el = document.createElement("div");
-    el.className = "toast";
+    el.className = `toast toast-${kind}`;
+    el.setAttribute("role", kind === "error" ? "alert" : "status");
     el.textContent = msg;
+    el.title = "Click to dismiss";
+    el.addEventListener("click", () => el.remove());
     container.appendChild(el);
-    setTimeout(() => {
-      el.remove();
-    }, 3500);
+    setTimeout(() => el.remove(), kind === "error" || kind === "warn" ? 8000 : 3500);
   }
 
+  // The log is a bounded ring so a long "Update All" session can't grow the DOM without limit
+  const LOG_MAX_LINES = 1500;
+  const logLines = ["WingetUI ready. Select packages above to install, update, or uninstall."];
+  let logFlushPending = false;
+
   function appendLog(line) {
-    const out = document.getElementById("console-output");
-    out.textContent += "\n" + line;
-    const body = document.getElementById("console-body");
-    body.scrollTop = body.scrollHeight;
+    for (const l of String(line).split("\n")) logLines.push(l);
+    if (logLines.length > LOG_MAX_LINES) logLines.splice(0, logLines.length - LOG_MAX_LINES);
+    if (logFlushPending) return;
+    logFlushPending = true;
+    requestAnimationFrame(() => {
+      logFlushPending = false;
+      const body = document.getElementById("console-body");
+      const stick = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+      document.getElementById("console-output").textContent = logLines.join("\n");
+      if (stick) body.scrollTop = body.scrollHeight;
+    });
+  }
+
+  function clearLog() {
+    logLines.length = 0;
+    logLines.push("Console cleared.");
+    document.getElementById("console-output").textContent = "Console cleared.";
+  }
+
+  // ---- Confirm dialog (styled; replaces window.confirm) ----
+  function showConfirm({ title, message, confirmLabel = "Confirm", danger = false }) {
+    return new Promise((resolve) => {
+      const modal = document.getElementById("modal-confirm");
+      document.getElementById("confirm-title").textContent = title;
+      document.getElementById("confirm-message").textContent = message;
+      const ok = document.getElementById("btn-confirm-ok");
+      const cancel = document.getElementById("btn-confirm-cancel");
+      ok.textContent = confirmLabel;
+      ok.className = danger ? "btn btn-danger" : "btn btn-primary";
+      modal.classList.remove("hidden");
+
+      const finish = (result) => {
+        modal.classList.add("hidden");
+        ok.removeEventListener("click", onOk);
+        cancel.removeEventListener("click", onCancel);
+        modal.removeEventListener("click", onBackdrop);
+        document.removeEventListener("keydown", onKey, true);
+        resolve(result);
+      };
+      const onOk = () => finish(true);
+      const onCancel = () => finish(false);
+      const onBackdrop = (e) => { if (e.target === modal) finish(false); };
+      const onKey = (e) => {
+        if (e.key === "Escape") { e.stopPropagation(); finish(false); }
+        else if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); finish(true); }
+      };
+      ok.addEventListener("click", onOk);
+      cancel.addEventListener("click", onCancel);
+      modal.addEventListener("click", onBackdrop);
+      document.addEventListener("keydown", onKey, true);
+      (danger ? cancel : ok).focus();
+    });
+  }
+
+  // ---- Task progress presentation ----
+  const OP_VERBS = {
+    install: { ing: "Installing", done: "installed", noun: "Install" },
+    upgrade: { ing: "Updating", done: "updated", noun: "Update" },
+    uninstall: { ing: "Uninstalling", done: "uninstalled", noun: "Uninstall" }
+  };
+
+  const PHASE_LABELS = {
+    prepare: "Preparing",
+    download: "Downloading",
+    verify: "Verifying installer",
+    install: "Installing",
+    uninstall: "Uninstalling",
+    finish: "Finishing",
+    confirm: "Confirming"
+  };
+
+  function phaseText(task, prog) {
+    if (!task) return "";
+    const p = prog || { phase: "prepare", percent: -1, detail: "" };
+    let label = PHASE_LABELS[p.phase] || (OP_VERBS[task.operation] || OP_VERBS.install).ing;
+    if (p.phase === "prepare") label = "Starting";
+    if (p.phase === "download" && p.percent >= 0) return `${label} ${p.percent}%`;
+    return label + "…";
+  }
+
+  // Lowercased ids -> what the task queue is doing with any of them
+  function taskStateFor(ids) {
+    const set = new Set((ids || []).filter(Boolean).map((i) => i.toLowerCase()));
+    if (state.currentTask && set.has(state.currentTask.packageId.toLowerCase())) {
+      return { kind: "running", task: state.currentTask };
+    }
+    const q = state.taskQueue.find((t) => set.has(t.packageId.toLowerCase()));
+    return q ? { kind: "queued", task: q } : null;
+  }
+
+  function renderTaskInline(st) {
+    if (!st) return "";
+    if (st.kind === "queued") {
+      const verb = (OP_VERBS[st.task.operation] || OP_VERBS.install).noun;
+      return `
+        <div class="task-inline queued">
+          <span class="status-pill status-busy">${escapeHtml(verb)} queued</span>
+          <button class="btn-icon btn-dequeue" data-dequeue="${escapeHtml(st.task.taskId)}" title="Remove from queue" aria-label="Remove from queue">&times;</button>
+        </div>`;
+    }
+    const prog = state.taskProgress;
+    const pct = prog && prog.percent >= 0 ? prog.percent : -1;
+    return `
+      <div class="task-inline running" data-task-inline>
+        <div class="mini-progress ${pct < 0 ? "indeterminate" : ""}" role="progressbar" aria-valuemin="0" aria-valuemax="100" ${pct >= 0 ? `aria-valuenow="${pct}"` : ""}>
+          <div class="mini-progress-fill" style="width:${pct < 0 ? 35 : pct}%"></div>
+        </div>
+        <span class="task-inline-label">${escapeHtml(phaseText(st.task, prog))}</span>
+      </div>`;
+  }
+
+  // Called on every task_progress message: patch the DOM in place instead of re-rendering tables
+  function updateTaskProgressUi() {
+    const task = state.currentTask;
+    const prog = state.taskProgress;
+    const pct = prog && prog.percent >= 0 ? prog.percent : -1;
+    const text = phaseText(task, prog);
+
+    document.querySelectorAll("[data-task-inline]").forEach((el) => {
+      const bar = el.querySelector(".mini-progress");
+      const fill = el.querySelector(".mini-progress-fill");
+      bar.classList.toggle("indeterminate", pct < 0);
+      if (pct >= 0) bar.setAttribute("aria-valuenow", pct);
+      else bar.removeAttribute("aria-valuenow");
+      fill.style.width = (pct < 0 ? 35 : pct) + "%";
+      el.querySelector(".task-inline-label").textContent = text;
+    });
+
+    const wrap = document.getElementById("task-progress");
+    if (!task) {
+      wrap.classList.add("hidden");
+      return;
+    }
+    wrap.classList.remove("hidden");
+    const bar = document.getElementById("task-progress-bar");
+    bar.classList.toggle("indeterminate", pct < 0);
+    document.getElementById("task-progress-fill").style.width = (pct < 0 ? 35 : pct) + "%";
+    const detail = prog && prog.detail ? ` · ${prog.detail}` : "";
+    document.getElementById("task-progress-text").textContent = text + detail;
+  }
+
+  // winget / installer return codes (doc/windows/package-manager/winget/returnCodes.md)
+  const WINGET_ERRORS = {
+    "8A150005": "The operation was cancelled.",
+    "8A150008": "Downloading the installer failed. Check your internet connection.",
+    "8A150010": "No installer in this package fits this PC (architecture, scope or OS version).",
+    "8A150011": "The downloaded installer's hash doesn't match the manifest. It was not run.",
+    "8A150014": "Package not found.",
+    "8A150016": "Multiple packages match this ID.",
+    "8A150019": "This operation needs administrator rights.",
+    "8A15002B": "No applicable update was found.",
+    "8A15002D": "The installer failed the security check.",
+    "8A15002E": "The download was incomplete.",
+    "8A15002F": "This app has no uninstall command registered.",
+    "8A150030": "The app's uninstaller failed.",
+    "8A150041": "The package agreements were not accepted.",
+    "8A150049": "The MSI installer failed.",
+    "8A15004F": "The available version isn't newer than the installed one.",
+    "8A150050": "The installed version is unknown, so winget won't upgrade it automatically.",
+    "8A150056": "This installer can't run from an administrator context.",
+    "8A150061": "The package is already installed.",
+    "8A150068": "The package is pinned, which prevents upgrades.",
+    "8A15006D": "A required service is busy. Try again later.",
+    "8A15007D": "This user-scope package can't be changed from an administrator context.",
+    "8A150086": "The download was empty. Check your internet connection.",
+    "8A15008E": "The update uses a different installer technology. Uninstall and reinstall instead.",
+    "8A150101": "The app is currently running. Close it and try again.",
+    "8A150102": "Another installation is in progress. Try again later.",
+    "8A150103": "Files are in use. Close the app and try again.",
+    "8A150104": "A dependency is missing from your system.",
+    "8A150105": "Not enough disk space.",
+    "8A150106": "Not enough memory to install.",
+    "8A150107": "This installer needs an internet connection.",
+    "8A150108": "The installer hit an error. Contact the publisher's support.",
+    "8A150109": "Restart your PC to finish installation.",
+    "8A15010A": "Installation failed. Restart your PC and try again.",
+    "8A15010B": "Your PC will restart to finish installation.",
+    "8A15010C": "The installation was cancelled in the installer.",
+    "8A15010D": "Another version of this app is already installed.",
+    "8A15010E": "A newer version of this app is already installed.",
+    "8A15010F": "Your organization's policies block this installation.",
+    "8A150110": "Failed to install the package's dependencies.",
+    "8A150111": "The app is in use by another application.",
+    "8A150113": "This package isn't supported on this system.",
+    "8A150114": "This installer can't upgrade an existing installation. Uninstall it first."
+  };
+
+  function describeExitCode(code) {
+    if (typeof code !== "number" || code === 0) return "";
+    const hex = (code >>> 0).toString(16).toUpperCase();
+    return WINGET_ERRORS[hex] || `winget exited with code 0x${hex}.`;
   }
 
   function findInstalledInfo(app) {
@@ -478,10 +675,12 @@
 
   // Queue Management
   function enqueueTask(operation, packageId, packageName) {
-    const exists = state.taskQueue.some(
-      (t) => t.packageId.toLowerCase() === packageId.toLowerCase() && t.operation === operation
-    );
-    if (exists) return;
+    if (!packageId) return;
+    // One pending operation per package: a second click (or install+uninstall) would race the first
+    if (taskStateFor([packageId])) {
+      showToast(`${packageName || packageId} already has a task queued`);
+      return;
+    }
 
     const task = {
       taskId: "t_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
@@ -490,37 +689,53 @@
       packageName: packageName || packageId
     };
     state.taskQueue.push(task);
+    state.batchTotal = (state.currentTask || state.taskQueue.length > 1) ? (state.batchTotal || 1) + 1 : 1;
     updateQueueUi();
     renderAll();
-
-    document.getElementById("console-body").classList.remove("hidden");
-    document.getElementById("console-toggle-label").textContent = "Terminal ▼";
 
     if (!state.currentTask) {
       runNextTask();
     }
   }
 
+  function removeQueuedTask(taskId) {
+    const before = state.taskQueue.length;
+    state.taskQueue = state.taskQueue.filter((t) => t.taskId !== taskId);
+    if (state.taskQueue.length !== before) {
+      state.batchTotal = Math.max(1, (state.batchTotal || 1) - 1);
+      updateQueueUi();
+      renderAll();
+    }
+  }
+
   function runNextTask() {
     if (state.taskQueue.length === 0) {
       state.currentTask = null;
+      state.taskProgress = null;
+      state.batchDone = 0;
+      state.batchTotal = 0;
       updateQueueUi();
       renderAll();
+      // Full refresh once the batch is over (per-task results were already applied from task_done)
       sendHost({ action: "scan_installed" });
       return;
     }
 
     state.currentTask = state.taskQueue.shift();
+    state.taskProgress = { phase: "prepare", percent: -1, detail: "" };
     updateQueueUi();
     renderAll();
 
+    const t = state.currentTask;
+    const installed = state.installedMap.get(t.packageId.toLowerCase());
     const silent = document.getElementById("toggle-silent").checked;
     sendHost({
       action: "run_winget_task",
-      taskId: state.currentTask.taskId,
-      operation: state.currentTask.operation,
-      packageId: state.currentTask.packageId,
-      packageName: state.currentTask.packageName,
+      taskId: t.taskId,
+      operation: t.operation,
+      packageId: t.packageId,
+      packageName: t.packageName,
+      fromVersion: installed ? installed.version || "" : "",
       silent
     });
   }
@@ -530,29 +745,120 @@
     const summary = document.getElementById("task-summary");
     const pill = document.getElementById("queue-pill");
     const cancelBtn = document.getElementById("btn-cancel-task");
+    const clearBtn = document.getElementById("btn-clear-queue");
 
     if (state.currentTask) {
+      const t = state.currentTask;
       dot.className = "status-dot busy";
-      const verb =
-        state.currentTask.operation === "install"
-          ? "Installing"
-          : state.currentTask.operation === "upgrade"
-          ? "Updating"
-          : "Uninstalling";
-      summary.textContent = `${verb} ${state.currentTask.packageName} (${state.currentTask.packageId})...`;
+      const verb = (OP_VERBS[t.operation] || OP_VERBS.install).ing;
+      const step = state.batchTotal > 1 ? ` (${(state.batchDone || 0) + 1} of ${state.batchTotal})` : "";
+      summary.textContent = `${verb} ${t.packageName}${step}`;
+      summary.title = t.packageId;
       cancelBtn.classList.remove("hidden");
     } else {
       dot.className = "status-dot done";
       summary.textContent = "Idle — Ready";
+      summary.title = "";
       cancelBtn.classList.add("hidden");
     }
 
     if (state.taskQueue.length > 0) {
       pill.textContent = `${state.taskQueue.length} queued`;
       pill.classList.remove("hidden");
+      clearBtn.classList.remove("hidden");
     } else {
       pill.classList.add("hidden");
+      clearBtn.classList.add("hidden");
+      document.getElementById("queue-popover").classList.add("hidden");
     }
+    renderQueuePopover();
+    updateTaskProgressUi();
+  }
+
+  function renderQueuePopover() {
+    const pop = document.getElementById("queue-popover");
+    if (pop.classList.contains("hidden")) return;
+    pop.innerHTML = `
+      <div class="queue-popover-title">Up next</div>
+      ${state.taskQueue
+        .map(
+          (t, i) => `
+        <div class="queue-row">
+          <span class="queue-index">${i + 1}</span>
+          <span class="queue-op queue-op-${escapeHtml(t.operation)}">${escapeHtml((OP_VERBS[t.operation] || OP_VERBS.install).noun)}</span>
+          <span class="queue-name" title="${escapeHtml(t.packageId)}">${escapeHtml(t.packageName)}</span>
+          <button class="btn-icon btn-dequeue" data-dequeue="${escapeHtml(t.taskId)}" title="Remove from queue" aria-label="Remove from queue">&times;</button>
+        </div>`
+        )
+        .join("")}
+    `;
+  }
+
+  // Applies a finished task to local state right away, so every view (presets, tables, search,
+  // details) reflects the result without waiting for the full rescan at the end of the queue.
+  function applyTaskResult(msg) {
+    const idLower = (msg.packageId || "").toLowerCase();
+    if (!idLower || !msg.success) return;
+    if (msg.verify === "confirmed" || msg.verify === "pending") {
+      if (msg.installed && msg.installed.id) {
+        const row = msg.installed;
+        const prev = state.installedMap.get(idLower);
+        if (prev && prev.localIcon && !row.localIcon) row.localIcon = prev.localIcon;
+        state.installedMap.delete(idLower);
+        state.installedMap.set(row.id.toLowerCase(), row);
+        const i = state.installedList.findIndex((p) => p.id.toLowerCase() === idLower);
+        if (i >= 0) state.installedList[i] = row;
+        else state.installedList.push(row);
+      } else if (!msg.installed && (msg.operation === "uninstall" || msg.verify === "confirmed")) {
+        state.installedMap.delete(idLower);
+        state.installedList = state.installedList.filter((p) => p.id.toLowerCase() !== idLower);
+      }
+    }
+    if (msg.operation === "upgrade" && msg.verify === "confirmed") {
+      state.updatesList = state.updatesList.filter((u) => (u.id || "").toLowerCase() !== idLower);
+    }
+    if (msg.operation === "uninstall" && msg.verify === "confirmed") {
+      state.updatesList = state.updatesList.filter((u) => (u.id || "").toLowerCase() !== idLower);
+    }
+  }
+
+  function reportTaskResult(msg) {
+    const name = msg.packageName || msg.packageId;
+    const verbs = OP_VERBS[msg.operation] || OP_VERBS.install;
+    let log, toast, kind;
+
+    if (!msg.success) {
+      const reason = describeExitCode(msg.exitCode);
+      const detail = msg.message && msg.message !== reason ? ` (${msg.message})` : "";
+      log = `⚠ ${verbs.noun} of ${name} failed: ${reason || msg.message || "unknown error"}${reason ? detail : ""}`;
+      toast = `${verbs.noun} failed: ${name} — ${reason || msg.message || "see Terminal for details"}`;
+      kind = "error";
+    } else if (msg.skipped) {
+      log = `• ${name}: nothing to do (${describeExitCode(msg.exitCode).replace(/\.$/, "").toLowerCase()}).`;
+      toast = msg.operation === "upgrade" ? `${name} is already up to date` : `${name} is already installed`;
+      kind = "info";
+    } else if (msg.verify === "pending") {
+      log =
+        msg.operation === "uninstall"
+          ? `⚠ winget reported ${name} as uninstalled, but it is still detected. The uninstaller may still be running, may need you to finish it, or a restart may be required.`
+          : msg.operation === "install"
+          ? `⚠ winget reported ${name} as installed, but it isn't detected yet. Store apps can take a while to finish in the background.`
+          : `⚠ winget reported ${name} as updated, but an update is still listed. The app may need to be closed or the PC restarted.`;
+      toast = `${name}: ${msg.operation} not confirmed yet — see Terminal`;
+      kind = "warn";
+    } else {
+      log = `✓ ${name} ${verbs.done}${msg.verify === "confirmed" ? " (confirmed)" : ""}.`;
+      toast = `${name} ${verbs.done}`;
+      kind = "success";
+    }
+
+    if (msg.success && msg.rebootRequired) {
+      log += " A restart is required to finish.";
+      toast += " — restart required";
+      kind = "warn";
+    }
+    appendLog(log);
+    showToast(toast, kind);
   }
 
   // Rendering: Category Pills
@@ -667,10 +973,34 @@
         if (act === "remove-preset") {
           removeAppFromPresets(catId, id);
         } else {
-          enqueueTask(act, id, name);
+          requestTask(act, id, name);
         }
       });
     });
+    bindDequeueButtons(container);
+  }
+
+  function bindDequeueButtons(container) {
+    container.querySelectorAll("[data-dequeue]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        removeQueuedTask(btn.getAttribute("data-dequeue"));
+      });
+    });
+  }
+
+  // Entry point for user-initiated single tasks: uninstalls are destructive, so ask first
+  async function requestTask(operation, id, name) {
+    if (operation === "uninstall") {
+      const ok = await showConfirm({
+        title: `Uninstall ${name || id}?`,
+        message: `This runs the app's uninstaller${document.getElementById("toggle-silent").checked ? " silently" : ""}. Its data may be removed too.`,
+        confirmLabel: "Uninstall",
+        danger: true
+      });
+      if (!ok) return;
+    }
+    enqueueTask(operation, id, name);
   }
 
   function renderPresetCard(app, catId) {
@@ -681,15 +1011,13 @@
     if (Array.isArray(app.altIds)) {
       app.altIds.forEach((a) => candidateIds.add(a.toLowerCase()));
     }
-    const isBusy =
-      (state.currentTask && candidateIds.has(state.currentTask.packageId.toLowerCase())) ||
-      state.taskQueue.some((t) => candidateIds.has(t.packageId.toLowerCase()));
+    const taskState = taskStateFor(Array.from(candidateIds));
 
     let statusHtml = "";
     let actionBtns = "";
 
-    if (isBusy) {
-      statusHtml = `<span class="status-pill status-busy">Working...</span>`;
+    if (taskState) {
+      statusHtml = renderTaskInline(taskState);
     } else if (info && info.available) {
       statusHtml = ""; // the Update button already says it; version details live in the Updates tab
       actionBtns = `
@@ -771,9 +1099,11 @@
 
     if (filtered.length === 0) {
       wrap.innerHTML = `<div class="empty-state">${
-        state.isScanning
+        state.checkingUpdates
+          ? `<div class="spinner"></div>Checking every installed package for updates…`
+          : state.isScanning
           ? "Scanning installed packages for available updates..."
-          : "All packages are up to date! Click 'Deep Scan Updates' to check again."
+          : "All packages are up to date! Click 'Deep Scan Updates' to also check apps with unknown versions."
       }</div>`;
       return;
     }
@@ -806,7 +1136,9 @@
               <td><span class="status-pill status-update">${escapeHtml(u.available || "Newer")}</span></td>
               <td>${renderReleaseDateCell(u.id)}</td>
               <td style="text-align:right">
-                <button class="btn btn-amber btn-sm" data-table-op="upgrade" data-id="${escapeHtml(u.id)}" data-name="${escapeHtml(u.name)}">Update</button>
+                <div class="table-actions">
+                  ${renderRowActions(u.id, `<button class="btn btn-amber btn-sm" data-table-op="upgrade" data-id="${escapeHtml(u.id)}" data-name="${escapeHtml(u.name)}">Update</button>`)}
+                </div>
               </td>
             </tr>
           `
@@ -879,13 +1211,16 @@
               <td><span class="status-pill status-missing">${escapeHtml(p.source || "system")}</span></td>
               <td style="text-align:right">
                 <div class="table-actions">
-                  ${
-                    p.available
-                      ? `<button class="btn btn-amber btn-sm" data-table-op="upgrade" data-id="${escapeHtml(p.id)}" data-name="${escapeHtml(p.name)}">Update</button>`
-                      : ""
-                  }
                   <button class="btn btn-ghost btn-sm" data-pin-id="${escapeHtml(p.id)}" data-pin-name="${escapeHtml(p.name)}" title="Save to My Presets">+ Preset</button>
-                  <button class="btn btn-danger-outline btn-sm" data-table-op="uninstall" data-id="${escapeHtml(p.id)}" data-name="${escapeHtml(p.name)}">Uninstall</button>
+                  ${renderRowActions(
+                    p.id,
+                    `${
+                      p.available
+                        ? `<button class="btn btn-amber btn-sm" data-table-op="upgrade" data-id="${escapeHtml(p.id)}" data-name="${escapeHtml(p.name)}">Update</button>`
+                        : ""
+                    }
+                    <button class="btn btn-danger-outline btn-sm" data-table-op="uninstall" data-id="${escapeHtml(p.id)}" data-name="${escapeHtml(p.name)}">Uninstall</button>`
+                  )}
                 </div>
               </td>
             </tr>
@@ -901,6 +1236,7 @@
 
   // App Details Popup Modal
   let activeDetailId = null;
+  let activeDetailName = null;
 
   function openAppDetailsModal(id, fallbackName, source) {
     if (!id) return;
@@ -945,34 +1281,8 @@
     const iconWrap = document.getElementById("detail-icon-wrap");
     iconWrap.innerHTML = renderAppIcon({ id: id, name: fallbackName, domain: "" }, false);
 
-    // Update install status
-    const isInst = state.installedMap.has(id.toLowerCase());
-    const instPill = document.getElementById("detail-install-status");
-    const actionBtn = document.getElementById("btn-detail-action");
-    if (isInst) {
-      const info = state.installedMap.get(id.toLowerCase());
-      instPill.className = "status-pill status-installed";
-      instPill.textContent = `Installed (${info.version || "Current"})`;
-      if (info && info.available) {
-        actionBtn.className = "btn btn-amber";
-        actionBtn.textContent = `Update to ${info.available}`;
-        actionBtn.setAttribute("data-table-op", "upgrade");
-      } else {
-        actionBtn.className = "btn btn-danger-outline";
-        actionBtn.textContent = "Uninstall";
-        actionBtn.setAttribute("data-table-op", "uninstall");
-      }
-      actionBtn.setAttribute("data-id", id);
-      actionBtn.setAttribute("data-name", fallbackName || id);
-    } else {
-      instPill.className = "status-pill status-missing";
-      instPill.textContent = "Not Installed";
-      actionBtn.className = "btn btn-primary";
-      actionBtn.textContent = "Install";
-      actionBtn.setAttribute("data-table-op", "install");
-      actionBtn.setAttribute("data-id", id);
-      actionBtn.setAttribute("data-name", fallbackName || id);
-    }
+    activeDetailName = fallbackName || id;
+    refreshDetailModalState();
 
     const addPresetBtn = document.getElementById("btn-detail-add-preset");
     addPresetBtn.onclick = () => {
@@ -997,8 +1307,57 @@
     });
   }
 
+  // Install status + primary action of the open details modal, recomputed from live state
+  function refreshDetailModalState() {
+    const id = activeDetailId;
+    if (!id) return;
+    const name = activeDetailName || id;
+    const instPill = document.getElementById("detail-install-status");
+    const actionBtn = document.getElementById("btn-detail-action");
+    const uninstallBtn = document.getElementById("btn-detail-uninstall");
+    const info = state.installedMap.get(id.toLowerCase());
+    const busy = taskStateFor([id]);
+
+    actionBtn.setAttribute("data-id", id);
+    actionBtn.setAttribute("data-name", name);
+    uninstallBtn.setAttribute("data-id", id);
+    uninstallBtn.setAttribute("data-name", name);
+    actionBtn.disabled = !!busy;
+    uninstallBtn.disabled = !!busy;
+    uninstallBtn.classList.toggle("hidden", !(info && info.available));
+
+    if (busy) {
+      instPill.className = "status-pill status-busy";
+      instPill.textContent =
+        busy.kind === "queued"
+          ? `${(OP_VERBS[busy.task.operation] || OP_VERBS.install).noun} queued`
+          : phaseText(busy.task, state.taskProgress);
+    } else if (info) {
+      instPill.className = "status-pill status-installed";
+      instPill.textContent = `Installed (${info.version || "Current"})`;
+    } else {
+      instPill.className = "status-pill status-missing";
+      instPill.textContent = "Not Installed";
+    }
+
+    if (info && info.available) {
+      actionBtn.className = "btn btn-amber";
+      actionBtn.textContent = `Update to ${info.available}`;
+      actionBtn.setAttribute("data-table-op", "upgrade");
+    } else if (info) {
+      actionBtn.className = "btn btn-danger-outline";
+      actionBtn.textContent = "Uninstall";
+      actionBtn.setAttribute("data-table-op", "uninstall");
+    } else {
+      actionBtn.className = "btn btn-primary";
+      actionBtn.textContent = "Install";
+      actionBtn.setAttribute("data-table-op", "install");
+    }
+  }
+
   function closeAppDetailsModal() {
     activeDetailId = null;
+    activeDetailName = null;
     const modal = document.getElementById("modal-app-details");
     if (modal) modal.classList.add("hidden");
   }
@@ -1006,7 +1365,8 @@
   // Rendering: Search View
   function renderSearch() {
     const wrap = document.getElementById("search-table-wrap");
-    if (!state.searchResults || state.searchResults.length === 0) {
+    // While a new query runs, keep its "Searching…" placeholder instead of repainting old results
+    if (state.searchInFlight || !state.searchResults || state.searchResults.length === 0) {
       return;
     }
 
@@ -1108,11 +1468,12 @@
                         Details
                       </button>
                       <button class="btn btn-ghost btn-sm" data-pin-id="${escapeHtml(r.id)}" data-pin-name="${escapeHtml(r.name)}">+ Presets</button>
-                      ${
+                      ${renderRowActions(
+                        r.id,
                         isInst
-                          ? `<span class="status-pill status-installed">Installed</span>`
+                          ? `<span class="status-pill status-installed">✓ Installed</span>`
                           : `<button class="btn btn-primary btn-sm" data-table-op="install" data-id="${escapeHtml(r.id)}" data-name="${escapeHtml(r.name)}">Install</button>`
-                      }
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -1153,9 +1514,10 @@
         const op = btn.getAttribute("data-table-op");
         const id = btn.getAttribute("data-id");
         const name = btn.getAttribute("data-name");
-        enqueueTask(op, id, name);
+        requestTask(op, id, name);
       });
     });
+    bindDequeueButtons(container);
 
     container.querySelectorAll("[data-pin-id]").forEach((btn) => {
       btn.addEventListener("click", (e) => {
@@ -1165,10 +1527,50 @@
     });
   }
 
+  function setButtonBusy(btnId, busy, busyLabel) {
+    const btn = document.getElementById(btnId);
+    if (!btn) return;
+    const label = btn.querySelector("span");
+    if (busy) {
+      if (label && !btn.dataset.idleLabel) btn.dataset.idleLabel = label.textContent;
+      if (label && busyLabel) label.textContent = busyLabel;
+      btn.disabled = true;
+      btn.classList.add("is-busy");
+    } else {
+      if (label && btn.dataset.idleLabel) label.textContent = btn.dataset.idleLabel;
+      delete btn.dataset.idleLabel;
+      btn.disabled = false;
+      btn.classList.remove("is-busy");
+    }
+  }
+
+  async function requestClose() {
+    if (state.currentTask) {
+      const ok = await showConfirm({
+        title: "A task is still running",
+        message: `Closing now aborts ${(OP_VERBS[state.currentTask.operation] || OP_VERBS.install).ing.toLowerCase()} ${state.currentTask.packageName}, which can leave it partially installed or removed${state.taskQueue.length ? `, and drops ${state.taskQueue.length} queued task${state.taskQueue.length === 1 ? "" : "s"}` : ""}.`,
+        confirmLabel: "Close anyway",
+        danger: true
+      });
+      if (!ok) return;
+    }
+    sendHost({ action: "window_close", force: true });
+  }
+
+  // Table action cell: the normal buttons, or the queued/progress state while a task owns the package
+  function renderRowActions(id, idleHtml) {
+    const st = taskStateFor([id]);
+    return st ? renderTaskInline(st) : idleHtml;
+  }
+
+  // Every view that shows install state must be refreshed here; the Search tab and the details
+  // modal were previously left showing stale "Installed" state after an uninstall.
   function renderAll() {
     renderPresets();
     renderUpdates();
     renderInstalled();
+    renderSearch();
+    refreshDetailModalState();
   }
 
   // Presets editing & Markdown export
@@ -1326,22 +1728,39 @@
       renderPresets();
     });
 
-    document.getElementById("btn-batch-uninstall").addEventListener("click", () => {
-      const count = state.selectedIds.size;
-      if (count === 0) return;
-      if (!confirm(`Uninstall ${count} selected package${count === 1 ? "" : "s"}?`)) return;
+    document.getElementById("btn-batch-uninstall").addEventListener("click", async () => {
+      // Only apps that are actually installed can be uninstalled
+      const targets = [];
       for (const id of state.selectedIds) {
         const app = findPresetAppById(id);
         const info = findInstalledInfo(app);
-        enqueueTask("uninstall", info ? info.id : app.id, app.name);
+        if (info) targets.push({ id: info.id, name: app.name });
       }
+      if (targets.length === 0) {
+        showToast("None of the selected apps are installed.");
+        return;
+      }
+      const names = targets.slice(0, 6).map((t) => t.name).join(", ") + (targets.length > 6 ? `, +${targets.length - 6} more` : "");
+      const ok = await showConfirm({
+        title: `Uninstall ${targets.length} app${targets.length === 1 ? "" : "s"}?`,
+        message: `${names}. Each app's uninstaller will run in turn.`,
+        confirmLabel: "Uninstall",
+        danger: true
+      });
+      if (!ok) return;
+      targets.forEach((t) => {
+        if (!taskStateFor([t.id])) enqueueTask("uninstall", t.id, t.name);
+      });
       state.selectedIds.clear();
       renderPresets();
     });
 
     document.getElementById("btn-check-updates").addEventListener("click", () => {
+      if (state.checkingUpdates) return;
+      state.checkingUpdates = true;
+      setButtonBusy("btn-check-updates", true, "Scanning…");
+      renderUpdates();
       sendHost({ action: "check_updates" });
-      showToast("Checking Winget repository for updates...");
     });
 
     document.getElementById("btn-update-all").addEventListener("click", () => {
@@ -1352,7 +1771,7 @@
       for (const u of state.updatesList) {
         if (u.id) map.set(u.id.toLowerCase(), u);
       }
-      const list = Array.from(map.values());
+      const list = Array.from(map.values()).filter((u) => !taskStateFor([u.id]));
       if (list.length === 0) {
         showToast("No updates available to install.");
         return;
@@ -1376,6 +1795,7 @@
       if (!q) return;
       state.searchSeq++;
       state.searchPending = true;
+      state.searchInFlight = true;
       const note = document.getElementById("search-trust-note");
       if (note) note.textContent = "";
       document.getElementById("search-table-wrap").innerHTML = `<div class="empty-state">Searching Winget catalog for "${escapeHtml(q)}"...</div>`;
@@ -1418,9 +1838,7 @@
       sendHost({ action: "window_maximize" });
     });
 
-    document.getElementById("win-btn-close")?.addEventListener("click", () => {
-      sendHost({ action: "window_close" });
-    });
+    document.getElementById("win-btn-close")?.addEventListener("click", requestClose);
 
     document.getElementById("btn-add-preset").addEventListener("click", () => openAddPresetModal());
     document.getElementById("btn-close-modal").addEventListener("click", () => {
@@ -1477,13 +1895,53 @@
 
     document.getElementById("btn-clear-log").addEventListener("click", (e) => {
       e.stopPropagation();
-      document.getElementById("console-output").textContent = "Console cleared.";
+      clearLog();
     });
 
-    document.getElementById("btn-cancel-task").addEventListener("click", (e) => {
+    // Cancel = stop the running task only; the queue carries on (use "Clear queue" to drop the rest)
+    document.getElementById("btn-cancel-task").addEventListener("click", async (e) => {
       e.stopPropagation();
+      const t = state.currentTask;
+      if (!t) return;
+      const ok = await showConfirm({
+        title: `Cancel ${(OP_VERBS[t.operation] || OP_VERBS.install).ing.toLowerCase()} ${t.packageName}?`,
+        message: "Stopping an installer midway can leave the app partially installed or removed.",
+        confirmLabel: "Stop task",
+        danger: true
+      });
+      if (!ok || state.currentTask !== t) return;
+      document.getElementById("btn-cancel-task").disabled = true;
+      document.getElementById("task-progress-text").textContent = "Cancelling…";
+      sendHost({ action: "cancel_task", taskId: t.taskId });
+    });
+
+    document.getElementById("btn-clear-queue").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const n = state.taskQueue.length;
       state.taskQueue = [];
-      sendHost({ action: "cancel_task" });
+      state.batchTotal = state.currentTask ? (state.batchDone || 0) + 1 : 0;
+      updateQueueUi();
+      renderAll();
+      if (n) showToast(`Removed ${n} queued task${n === 1 ? "" : "s"}`);
+    });
+
+    document.getElementById("queue-pill").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const pop = document.getElementById("queue-popover");
+      pop.classList.toggle("hidden");
+      renderQueuePopover();
+    });
+
+    document.getElementById("queue-popover").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const btn = e.target.closest("[data-dequeue]");
+      if (btn) removeQueuedTask(btn.getAttribute("data-dequeue"));
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest("#queue-popover, #queue-pill")) {
+        document.getElementById("queue-popover").classList.add("hidden");
+      }
     });
 
     // Details Modal Event Listeners
@@ -1493,21 +1951,26 @@
       if (e.target.id === "modal-app-details") closeAppDetailsModal();
     });
 
+    // The modal stays open so the user can watch the task's progress in its status pill
     document.getElementById("btn-detail-action")?.addEventListener("click", () => {
       const btn = document.getElementById("btn-detail-action");
       const op = btn.getAttribute("data-table-op");
       const id = btn.getAttribute("data-id");
       const name = btn.getAttribute("data-name");
-      if (op && id) {
-        enqueueTask(op, id, name);
-        closeAppDetailsModal();
-      }
+      if (op && id) requestTask(op, id, name);
+    });
+
+    document.getElementById("btn-detail-uninstall")?.addEventListener("click", () => {
+      const btn = document.getElementById("btn-detail-uninstall");
+      const id = btn.getAttribute("data-id");
+      if (id) requestTask("uninstall", id, btn.getAttribute("data-name"));
     });
 
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
         closeAppDetailsModal();
         document.getElementById("modal-add-preset")?.classList.add("hidden");
+        document.getElementById("queue-popover").classList.add("hidden");
       }
     });
 
@@ -1541,6 +2004,7 @@
         switch (msg.type) {
           case "presets_loaded":
             state.presets = msg.data || { categories: [] };
+            if (msg.appVersion) document.getElementById("app-version").textContent = `v${msg.appVersion}`;
             renderCategoryPills();
             renderPresets();
             break;
@@ -1555,19 +2019,31 @@
             state.isScanning = false;
             document.querySelector(".icon-spin-target").classList.remove("spinning");
             state.installedList = msg.packages || [];
-            state.updatesList = []; // clear stale Deep Scan cache so updated packages drop off immediately
             state.installedMap.clear();
             for (const p of state.installedList) {
               if (p.id) state.installedMap.set(p.id.toLowerCase(), p);
             }
+            // Keep Deep Scan results only while they still describe what's installed: drop packages
+            // that were removed or whose installed version changed (i.e. were updated)
+            state.updatesList = state.updatesList.filter((u) => {
+              const cur = u.id && state.installedMap.get(u.id.toLowerCase());
+              return cur && (cur.version || "") === (u.version || "");
+            });
             document.getElementById("scan-status-text").textContent = `Last scan: ${msg.timestamp}`;
             renderAll();
             break;
 
           case "updates_list":
             state.updatesList = msg.updates || [];
+            state.checkingUpdates = false;
+            setButtonBusy("btn-check-updates", false);
             renderUpdates();
-            showToast(`Found ${state.updatesList.length} package updates`);
+            showToast(
+              state.updatesList.length
+                ? `Found ${state.updatesList.length} update${state.updatesList.length === 1 ? "" : "s"}`
+                : "Everything is up to date",
+              "success"
+            );
             break;
 
           case "package_metadata":
@@ -1597,13 +2073,14 @@
           case "scan_complete":
             state.isScanning = false;
             document.querySelector(".icon-spin-target").classList.remove("spinning");
-            if (msg.error) showToast(`Scan problem: ${msg.error}`);
+            if (msg.error) showToast(`Scan problem: ${msg.error}`, "error");
             renderAll();
             hideSplash();
             break;
 
           case "search_results":
             if (typeof msg.seq === "number" && msg.seq !== state.searchSeq) break;
+            state.searchInFlight = false;
             state.searchResults = msg.results || [];
             state.searchPending = state.searchResults.length > 0;
             if (state.searchResults.length === 0) {
@@ -1755,36 +2232,36 @@
             break;
 
           case "task_started":
-            appendLog(`\n▶ Executing: ${msg.command}`);
+            appendLog(`\n▶ ${msg.command}`);
             break;
 
           case "task_log":
             appendLog(`  ${msg.line}`);
             break;
 
+          case "task_progress":
+            if (!state.currentTask || msg.taskId !== state.currentTask.taskId) break;
+            state.taskProgress = { phase: msg.phase, percent: msg.percent, detail: msg.detail || "" };
+            updateTaskProgressUi();
+            if (activeDetailId) refreshDetailModalState();
+            break;
+
           case "task_done":
-            appendLog(
-              msg.skipped
-                ? `• ${msg.packageName}: nothing to do (already installed / no applicable update).`
-                : msg.success
-                ? `✓ Finished ${msg.packageName} (${msg.operation}) successfully.`
-                : `⚠ ${msg.packageName} exited with code ${msg.exitCode}.`
-            );
-            showToast(
-              msg.skipped
-                ? `${msg.packageName}: already up to date`
-                : msg.success
-                ? `${msg.packageName}: ${msg.operation} complete!`
-                : `${msg.packageName}: ${msg.operation} finished (code ${msg.exitCode})`
-            );
+            if (state.currentTask && msg.taskId !== state.currentTask.taskId) break; // stale
+            applyTaskResult(msg);
+            reportTaskResult(msg);
+            state.batchDone = (state.batchDone || 0) + 1;
+            document.getElementById("btn-cancel-task").disabled = false;
             runNextTask();
             break;
 
           case "task_cancelled":
-            appendLog(`✖ Active operation cancelled by user.`);
-            state.currentTask = null;
-            updateQueueUi();
-            renderAll();
+            if (state.currentTask && msg.taskId && msg.taskId !== state.currentTask.taskId) break;
+            appendLog(`✖ ${msg.packageName || "Task"} cancelled. Its state is re-checked by the next scan.`);
+            showToast(`Cancelled ${msg.packageName || "task"}`, "warn");
+            state.batchDone = (state.batchDone || 0) + 1;
+            document.getElementById("btn-cancel-task").disabled = false;
+            runNextTask();
             break;
 
           case "exported_winget_txt":
@@ -1812,7 +2289,11 @@
 
           case "error":
             appendLog(`✖ Error: ${msg.message}`);
-            showToast(`Error: ${msg.message}`);
+            showToast(`Error: ${msg.message}`, "error");
+            if (state.checkingUpdates) {
+              state.checkingUpdates = false;
+              setButtonBusy("btn-check-updates", false);
+            }
             break;
         }
       });
@@ -1825,8 +2306,6 @@
       hideSplash();
     }
 
-    document.getElementById("splash-close")?.addEventListener("click", () => {
-      sendHost({ action: "window_close" });
-    });
+    document.getElementById("splash-close")?.addEventListener("click", requestClose);
   });
 })();

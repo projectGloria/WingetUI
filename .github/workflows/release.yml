@@ -1,0 +1,183 @@
+name: Release
+
+# Pushing a commit to main that changes the version in gloria.toml builds the GloriaSetup installer and
+# publishes it as GitHub Release v<version>. Manual runs build (and, with dry_run off, publish) the
+# current version.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and verify the installer without publishing a release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      build: ${{ steps.read.outputs.build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Read and compare version
+        id: read
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          read_toml() { sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1; }
+          version=$(read_toml < gloria.toml)
+          [ -n "$version" ] || { echo "::error::No version in gloria.toml"; exit 1; }
+
+          # WingetUI.cs carries the same version in its assembly attributes; they must agree
+          asm=$(sed -n 's/.*AssemblyInformationalVersion("\([^"]*\)").*/\1/p' WingetUI.cs | head -n1)
+          if [ "$asm" != "$version" ]; then
+            echo "::error::gloria.toml ($version) and WingetUI.cs AssemblyInformationalVersion ($asm) differ"
+            exit 1
+          fi
+          for attr in AssemblyVersion AssemblyFileVersion; do
+            v=$(sed -n "s/.*${attr}(\"\([^\"]*\)\").*/\1/p" WingetUI.cs | head -n1)
+            case "$v" in
+              "${version%%-*}"|"${version%%-*}.0") ;;
+              *) echo "::error::WingetUI.cs $attr ($v) does not match $version"; exit 1 ;;
+            esac
+          done
+
+          build=false
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            build=true
+          else
+            previous=""
+            if [ -n "${BEFORE:-}" ] && ! [[ "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              previous=$(git show "$BEFORE:gloria.toml" 2>/dev/null | read_toml || true)
+            fi
+            [ "$previous" != "$version" ] && build=true
+            echo "Previous version: ${previous:-<none>}"
+          fi
+          echo "Version: $version, build: $build"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 20
+
+      - name: Build and stage WingetUI
+        shell: pwsh
+        run: |
+          ./build.ps1
+          foreach ($f in 'WingetUI.exe', 'Microsoft.Web.WebView2.Core.dll', 'Microsoft.Web.WebView2.WinForms.dll',
+                         'WebView2Loader.dll', 'presets.json', 'ui\index.html', 'ui\app.js', 'ui\styles.css') {
+            if (-not (Test-Path "dist\WingetUI\$f")) { throw "Staged app is missing $f" }
+          }
+          $ver = (Get-Item dist\WingetUI\WingetUI.exe).VersionInfo.ProductVersion
+          if ($ver -ne $env:VERSION) { throw "WingetUI.exe reports $ver, expected $env:VERSION" }
+
+      - name: Fetch WebView2 bootstrapper
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          $boot = 'build\MicrosoftEdgeWebview2Setup.exe'
+          Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $boot -UseBasicParsing
+          $sig = Get-AuthenticodeSignature $boot
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            throw "WebView2 bootstrapper signature check failed: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          }
+
+      - name: Pack installer with GloriaSetup
+        shell: pwsh
+        run: |
+          npx --yes gloria-setup@0.2.0 --app dist\WingetUI --manifest gloria.toml --version $env:VERSION --out dist `
+            --webview2-bootstrapper build\MicrosoftEdgeWebview2Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw "gloria-pack failed with exit code $LASTEXITCODE" }
+
+      - name: Verify installer (silent dry run)
+        shell: pwsh
+        run: |
+          $setup = "dist\WingetUI_$($env:VERSION)_x64-setup.exe"
+          if (-not (Test-Path $setup)) { throw "Expected installer not found: $setup" }
+          $proc = Start-Process -FilePath $setup -ArgumentList '/S --dry-run' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "GloriaSetup dry-run failed with exit code $($proc.ExitCode)" }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installer
+          path: dist/WingetUI_${{ needs.version.outputs.version }}_x64-setup.exe
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || !inputs.dry_run)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download installer
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: installer
+          path: release-assets
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum *_x64-setup.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create draft release and upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::Release $tag already exists. Bump the version in gloria.toml and WingetUI.cs."
+            exit 1
+          fi
+          pre=()
+          [[ "$VERSION" == *-* ]] && pre=(--prerelease)
+          gh release create "$tag" --draft --target "$GITHUB_SHA" --title "WingetUI $tag" --generate-notes "${pre[@]}" \
+            "release-assets/WingetUI_${VERSION}_x64-setup.exe" release-assets/SHA256SUMS.txt
+
+      - name: Verify uploaded assets and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          mkdir verify && cd verify
+          gh release download "$tag" --pattern '*_x64-setup.exe' --pattern 'SHA256SUMS.txt'
+          sha256sum --check SHA256SUMS.txt
+          gh release edit "$tag" --draft=false

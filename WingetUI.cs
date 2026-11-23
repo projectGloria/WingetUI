@@ -22,9 +22,9 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyProduct("WingetUI")]
 [assembly: AssemblyDescription("Package & Preset Manager for winget")]
 [assembly: AssemblyCompany("projectGloria")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
-[assembly: AssemblyInformationalVersion("1.1.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyInformationalVersion("1.2.0")]
 
 namespace WingetUI
 {
@@ -71,9 +71,16 @@ namespace WingetUI
         private bool devTools;
         private int scanBusy = 0;      // 1 while a scan_installed run is in flight
         private int scanPending = 0;   // 1 if another scan_installed was requested while scanBusy == 1
-        private volatile bool activeTaskCancelled = false;
-        private Process activeProcess = null;
+        // Mutating winget task state, all guarded by procLock. activeTaskId is set the moment the
+        // run_winget_task message arrives (before the worker thread starts), so a cancel that races
+        // the process start is never lost.
+        private string activeTaskId = null;
+        private string cancelledTaskId = null;
+        private int activePid = 0;
+        private Action activeTerminate = null;
+        private bool forceClose = false;
         private readonly object procLock = new object();
+        private readonly string appVersion = Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
         private readonly object cacheLock = new object();
         private readonly SemaphoreSlim wingetShowGate = new SemaphoreSlim(4);
 
@@ -138,6 +145,21 @@ namespace WingetUI
             this.Load += async (s, e) => await InitializeWebViewAsync();
             this.FormClosing += (s, e) =>
             {
+                bool busy;
+                lock (procLock) { busy = activeTaskId != null; }
+                // Alt+F4 / taskbar close while an installer runs: aborting can leave a half-installed app.
+                // (The in-app close button asks in the UI first and sets forceClose.)
+                if (busy && !forceClose && e.CloseReason == CloseReason.UserClosing)
+                {
+                    var answer = MessageBox.Show(this,
+                        "A winget task is still running. Closing WingetUI now will abort it, which can leave the app partially installed or removed.\n\nClose anyway?",
+                        "WingetUI", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                    if (answer != DialogResult.Yes)
+                    {
+                        e.Cancel = true;
+                        return;
+                    }
+                }
                 KillActiveProcess();
                 SaveMetaCache();
             };
@@ -168,15 +190,36 @@ namespace WingetUI
         }
 
         // The presets.json shipped beside the exe is only a seed; edits are written to Data\.
+        // On first run, presets saved by an earlier install in another folder are carried over first:
+        // v1.0/v1.1 shipped an Inno Setup installer (%LOCALAPPDATA%\Programs\WingetUI), and GloriaSetup
+        // installs elsewhere, so without this an upgrade would silently reset the user's presets.
         private void SeedPresets()
         {
             try
             {
-                string seed = Path.Combine(appDir, "presets.json");
-                if (!File.Exists(presetsPath) && File.Exists(seed))
+                if (File.Exists(presetsPath)) return;
+
+                string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                string[] legacyDataDirs =
                 {
-                    File.Copy(seed, presetsPath);
+                    Path.Combine(localAppData, @"Programs\WingetUI\Data"),
+                    Path.Combine(localAppData, "WingetUI"),
+                    Path.Combine(localAppData, "WingetBaby")
+                };
+                string ownDir = Path.GetFullPath(dataDir).TrimEnd('\\');
+                foreach (string dir in legacyDataDirs)
+                {
+                    if (string.Equals(Path.GetFullPath(dir).TrimEnd('\\'), ownDir, StringComparison.OrdinalIgnoreCase)) continue;
+                    string legacyPresets = Path.Combine(dir, "presets.json");
+                    if (!File.Exists(legacyPresets)) continue;
+                    File.Copy(legacyPresets, presetsPath);
+                    string legacyCache = Path.Combine(dir, "meta-cache.json");
+                    if (File.Exists(legacyCache) && !File.Exists(metaCachePath)) File.Copy(legacyCache, metaCachePath);
+                    return;
                 }
+
+                string seed = Path.Combine(appDir, "presets.json");
+                if (File.Exists(seed)) File.Copy(seed, presetsPath);
             }
             catch { }
         }
@@ -361,8 +404,12 @@ namespace WingetUI
                     case "save_presets":
                         if (msg.ContainsKey("data"))
                         {
+                            // Write-then-swap so a crash mid-write can't leave a truncated presets file
                             string formatted = json.Serialize(msg["data"]);
-                            File.WriteAllText(presetsPath, formatted, Encoding.UTF8);
+                            string tmpPresets = presetsPath + ".tmp";
+                            File.WriteAllText(tmpPresets, formatted, Encoding.UTF8);
+                            if (File.Exists(presetsPath)) File.Replace(tmpPresets, presetsPath, null);
+                            else File.Move(tmpPresets, presetsPath);
                             SendToUi(new { type = "presets_saved", success = true });
                         }
                         break;
@@ -396,14 +443,28 @@ namespace WingetUI
                         string operation = msg.ContainsKey("operation") ? Convert.ToString(msg["operation"]) : "install";
                         string packageId = msg.ContainsKey("packageId") ? Convert.ToString(msg["packageId"]) : "";
                         string packageName = msg.ContainsKey("packageName") ? Convert.ToString(msg["packageName"]) : packageId;
+                        string fromVersion = msg.ContainsKey("fromVersion") ? Convert.ToString(msg["fromVersion"]) : "";
                         bool silent = !msg.ContainsKey("silent") || Convert.ToBoolean(msg["silent"]);
-                        await Task.Run(() => HandleRunWingetTask(taskId, operation, packageId, packageName, silent));
+                        lock (procLock)
+                        {
+                            if (activeTaskId != null)
+                            {
+                                // The UI queue runs one task at a time; refuse rather than run two installers at once
+                                SendToUi(new { type = "task_done", taskId = taskId, operation = operation, packageId = packageId,
+                                    packageName = packageName, exitCode = -1, success = false, skipped = false,
+                                    verify = "none", message = "Another winget task is still running." });
+                                break;
+                            }
+                            activeTaskId = taskId;
+                            cancelledTaskId = null;
+                        }
+                        await Task.Run(() => HandleRunWingetTask(taskId, operation, packageId, packageName, silent, fromVersion));
                         break;
 
                     case "cancel_task":
-                        activeTaskCancelled = true;
-                        await Task.Run(() => KillActiveProcess());
-                        SendToUi(new { type = "task_cancelled" });
+                        string cancelId = msg.ContainsKey("taskId") ? Convert.ToString(msg["taskId"]) : "";
+                        // task_cancelled is sent by the worker once the process is really gone
+                        await Task.Run(() => CancelTask(cancelId));
                         break;
 
                     case "open_file":
@@ -450,7 +511,10 @@ namespace WingetUI
                         break;
 
                     case "window_close":
+                        // The UI already asked the user if a task is running
+                        forceClose = msg.ContainsKey("force") && Convert.ToBoolean(msg["force"]);
                         this.Close();
+                        forceClose = false;
                         break;
                 }
             }
@@ -470,7 +534,8 @@ namespace WingetUI
                 {
                     type = "presets_loaded",
                     data = data,
-                    wingetTxtPath = wingetTxtPath
+                    wingetTxtPath = wingetTxtPath,
+                    appVersion = appVersion
                 });
             }
             else
@@ -479,7 +544,8 @@ namespace WingetUI
                 {
                     type = "presets_loaded",
                     data = new { categories = new object[0] },
-                    wingetTxtPath = wingetTxtPath
+                    wingetTxtPath = wingetTxtPath,
+                    appVersion = appVersion
                 });
             }
         }
@@ -1135,7 +1201,7 @@ namespace WingetUI
                 req.Method = "GET";
                 req.Timeout = timeoutMs;
                 req.ReadWriteTimeout = timeoutMs;
-                req.UserAgent = "WingetUI/1.1.0";
+                req.UserAgent = "WingetUI/" + appVersion;
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 using (var reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
                 {
@@ -1521,33 +1587,67 @@ namespace WingetUI
             return d;
         }
 
-        private void HandleRunWingetTask(string taskId, string operation, string packageId, string packageName, bool silent)
+        private const int WINGET_NO_PACKAGES_FOUND = -1978335212;      // 0x8A150014
+        private const int WINGET_REBOOT_TO_FINISH = -1978334967;       // 0x8A150109
+        private const int WINGET_REBOOT_INITIATED = -1978334965;       // 0x8A15010B
+
+        private void SendTaskProgress(string taskId, string phase, int percent, string detail)
+        {
+            SendToUi(new { type = "task_progress", taskId = taskId, phase = phase, percent = percent, detail = detail ?? "" });
+        }
+
+        private static string BuildTaskArgs(string operation, string safeId, bool silent)
+        {
+            // --disable-interactivity: a prompt would otherwise hang forever (there is no one to answer it)
+            string common = " --accept-source-agreements --disable-interactivity";
+            string args;
+            if (operation == "install")
+                args = string.Format("install -e --id \"{0}\" --accept-package-agreements", safeId) + common;
+            else if (operation == "upgrade")
+                // --include-unknown: packages whose installed version winget can't read can still be upgraded
+                args = string.Format("upgrade -e --id \"{0}\" --accept-package-agreements --include-unknown", safeId) + common;
+            else if (operation == "uninstall")
+                args = string.Format("uninstall -e --id \"{0}\"", safeId) + common;
+            else
+                return null;
+            if (silent) args += " --silent";
+            return args;
+        }
+
+        private void HandleRunWingetTask(string taskId, string operation, string packageId, string packageName, bool silent, string fromVersion)
+        {
+            try
+            {
+                RunWingetTaskCore(taskId, operation, packageId, packageName, silent, fromVersion);
+            }
+            finally
+            {
+                lock (procLock)
+                {
+                    if (activeTaskId == taskId) activeTaskId = null;
+                    activePid = 0;
+                    activeTerminate = null;
+                }
+                SetTaskbarProgress(0, 0);
+            }
+        }
+
+        private bool IsCancelled(string taskId)
+        {
+            lock (procLock) { return cancelledTaskId != null && cancelledTaskId == taskId; }
+        }
+
+        private void RunWingetTaskCore(string taskId, string operation, string packageId, string packageName, bool silent, string fromVersion)
         {
             string safeId = SanitizeWingetArg(packageId);
-            string args;
-
-            if (operation == "install")
+            string args = BuildTaskArgs(operation, safeId, silent);
+            if (args == null || string.IsNullOrEmpty(safeId))
             {
-                args = string.Format("install -e --id \"{0}\" --accept-package-agreements --accept-source-agreements", safeId);
-                if (silent) args += " --silent";
-            }
-            else if (operation == "upgrade")
-            {
-                args = string.Format("upgrade -e --id \"{0}\" --accept-package-agreements --accept-source-agreements", safeId);
-                if (silent) args += " --silent";
-            }
-            else if (operation == "uninstall")
-            {
-                args = string.Format("uninstall -e --id \"{0}\" --accept-source-agreements", safeId);
-                if (silent) args += " --silent";
-            }
-            else
-            {
-                SendToUi(new { type = "task_done", taskId = taskId, packageId = packageId, exitCode = -1, success = false });
+                SendToUi(new { type = "task_done", taskId = taskId, operation = operation, packageId = packageId, packageName = packageName,
+                    exitCode = -1, success = false, skipped = false, verify = "none", message = "Invalid task." });
                 return;
             }
 
-            activeTaskCancelled = false;
             SendToUi(new
             {
                 type = "task_started",
@@ -1558,72 +1658,106 @@ namespace WingetUI
                 command = "winget " + args
             });
 
+            // Progress state shared by the output parser callbacks (all on the reader thread)
+            string phase = "prepare";
+            int percent = -1;
+            string bytes = "";
+            long lastSentTicks = 0;
+            Action<bool> push = force =>
+            {
+                long now = DateTime.UtcNow.Ticks;
+                if (!force && now - lastSentTicks < TimeSpan.TicksPerMillisecond * 120) return;
+                lastSentTicks = now;
+                SendTaskProgress(taskId, phase, percent, bytes);
+                SetTaskbarProgress(percent >= 0 ? 2 : 1, Math.Max(0, percent));
+            };
+            SendTaskProgress(taskId, phase, -1, "");
+            SetTaskbarProgress(1, 0);
+
+            var parser = new WingetOutputParser();
+            parser.OnLine = text =>
+            {
+                SendToUi(new { type = "task_log", taskId = taskId, packageId = packageId, line = text });
+                string next = phase;
+                if (text.StartsWith("Downloading ", StringComparison.OrdinalIgnoreCase)) next = "download";
+                else if (text.IndexOf("verified installer hash", StringComparison.OrdinalIgnoreCase) >= 0) next = "verify";
+                else if (text.StartsWith("Starting package install", StringComparison.OrdinalIgnoreCase)) next = "install";
+                else if (text.StartsWith("Starting package uninstall", StringComparison.OrdinalIgnoreCase)) next = "uninstall";
+                else if (text.StartsWith("Successfully installed", StringComparison.OrdinalIgnoreCase) ||
+                         text.StartsWith("Successfully uninstalled", StringComparison.OrdinalIgnoreCase)) next = "finish";
+                if (next != phase)
+                {
+                    phase = next;
+                    percent = -1;
+                    bytes = "";
+                    push(true);
+                }
+            };
+            parser.OnProgress = (state, pct) =>
+            {
+                if (state == 1)
+                {
+                    if (phase == "prepare") phase = "download";
+                    if (pct != percent) { percent = pct; push(pct == 100); }
+                }
+                else if (state == 3 || state == 0)
+                {
+                    if (percent != -1) { percent = -1; push(true); }
+                }
+            };
+            parser.OnBytes = b =>
+            {
+                if (phase == "prepare") phase = "download";
+                bytes = b;
+                push(false);
+            };
+
             int exitCode = -1;
-            Process proc = null;
+            string startError = null;
             try
             {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "winget.exe",
-                    Arguments = args,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = Encoding.UTF8,
-                    StandardErrorEncoding = Encoding.UTF8
-                };
-
-                proc = new Process { StartInfo = psi };
-                lock (procLock)
-                {
-                    activeProcess = proc;
-                }
-
-                proc.Start();
-
-                // Stream stdout and stderr cleanly
-                Task outReader = Task.Run(() => StreamReaderLoop(proc.StandardOutput, taskId, packageId));
-                Task errReader = Task.Run(() => StreamReaderLoop(proc.StandardError, taskId, packageId));
-
-                proc.WaitForExit();
-                Task.WaitAll(new[] { outReader, errReader }, 2000);
-                exitCode = proc.ExitCode;
+                exitCode = RunWithConsole(taskId, "winget.exe " + args, args, parser);
             }
             catch (Exception ex)
             {
-                if (!activeTaskCancelled)
-                {
-                    SendToUi(new
-                    {
-                        type = "task_log",
-                        taskId = taskId,
-                        packageId = packageId,
-                        line = "Error: " + ex.Message
-                    });
-                }
-            }
-            finally
-            {
-                lock (procLock)
-                {
-                    activeProcess = null;
-                }
-                if (proc != null)
-                {
-                    try { proc.Dispose(); } catch { }
-                }
+                startError = DescribeStartFailure(ex);
+                SendToUi(new { type = "task_log", taskId = taskId, packageId = packageId, line = "Error: " + startError });
             }
 
             Dictionary<string, string> removed;
             detailsCache.TryRemove(packageId, out removed);
 
-            // cancel_task already emitted task_cancelled; don't emit a conflicting task_done
-            if (activeTaskCancelled) return;
+            if (IsCancelled(taskId))
+            {
+                SendToUi(new { type = "task_cancelled", taskId = taskId, packageId = packageId, packageName = packageName });
+                return;
+            }
 
             // "No applicable update" / "already installed" are no-ops, not failures
             bool skipped = (exitCode == WINGET_UPDATE_NOT_APPLICABLE || exitCode == WINGET_ALREADY_INSTALLED);
-            bool success = (exitCode == 0) || skipped;
+            bool rebootRequired = (exitCode == WINGET_REBOOT_TO_FINISH || exitCode == WINGET_REBOOT_INITIATED);
+            bool success = (exitCode == 0) || skipped || rebootRequired;
+
+            // winget's exit code says the command finished, not that the system state changed: Store
+            // installs complete asynchronously and many uninstallers relaunch themselves from %TEMP% and
+            // exit immediately. Ask winget what is installed now before telling the UI it's done.
+            string verify = "none";
+            Dictionary<string, string> row = null;
+            if (success && startError == null)
+            {
+                phase = "confirm";
+                percent = -1;
+                bytes = "";
+                push(true);
+                verify = VerifyTaskOutcome(taskId, operation, packageId, fromVersion, out row);
+                if (row != null) AttachLocalRegistryIcons(new List<Dictionary<string, string>> { row });
+                if (IsCancelled(taskId))
+                {
+                    SendToUi(new { type = "task_cancelled", taskId = taskId, packageId = packageId, packageName = packageName });
+                    return;
+                }
+            }
+
             SendToUi(new
             {
                 type = "task_done",
@@ -1633,88 +1767,260 @@ namespace WingetUI
                 packageName = packageName,
                 exitCode = exitCode,
                 success = success,
-                skipped = skipped
+                skipped = skipped,
+                rebootRequired = rebootRequired,
+                verify = verify,               // confirmed | pending | unknown | none
+                installed = row,               // fresh `winget list` row for the package, or null if absent
+                message = startError ?? parser.LastProblemLine
             });
         }
 
-        private void StreamReaderLoop(StreamReader reader, string taskId, string packageId)
+        // Runs winget under a pseudo console (real progress) or, if ConPTY is unavailable, with plain
+        // redirected pipes. Returns the exit code.
+        private int RunWithConsole(string taskId, string commandLine, string args, WingetOutputParser parser)
         {
-            var buffer = new StringBuilder();
-            int ch;
-            string lastSent = "";
-
-            while ((ch = reader.Read()) != -1)
+            PtyProcess pty = PtyProcess.Start(commandLine);
+            if (pty != null)
             {
-                if (ch == '\r' || ch == '\n')
+                using (pty)
                 {
-                    if (buffer.Length > 0)
+                    if (!RegisterActive(taskId, pty.Pid, () => pty.Terminate())) return -1;
+
+                    var reader = new Thread(() =>
                     {
-                        string line = buffer.ToString().Trim();
-                        buffer.Clear();
-                        // Skip single-character spinner frames (- \ | /)
-                        if (line.Length > 1 && line != lastSent)
+                        try
                         {
-                            lastSent = line;
-                            SendToUi(new
+                            using (var sr = new StreamReader(pty.Output, new UTF8Encoding(false)))
                             {
-                                type = "task_log",
-                                taskId = taskId,
-                                packageId = packageId,
-                                line = line
-                            });
+                                var buf = new char[2048];
+                                int n;
+                                while ((n = sr.Read(buf, 0, buf.Length)) > 0) parser.Feed(buf, n);
+                            }
                         }
-                    }
-                }
-                else
-                {
-                    buffer.Append((char)ch);
+                        catch { }
+                        parser.Flush();
+                    });
+                    reader.IsBackground = true;
+                    reader.Start();
+
+                    pty.WaitForExit();
+                    int code = pty.ExitCode;
+                    // Let the reader drain, then close the console so the output stream ends
+                    reader.Join(400);
+                    pty.ClosePseudoConsole();
+                    reader.Join(3000);
+                    return code;
                 }
             }
 
-            if (buffer.Length > 1)
+            var psi = new ProcessStartInfo
             {
-                SendToUi(new
-                {
-                    type = "task_log",
-                    taskId = taskId,
-                    packageId = packageId,
-                    line = buffer.ToString().Trim()
-                });
+                FileName = "winget.exe",
+                Arguments = args,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
+            };
+            using (var proc = Process.Start(psi))
+            {
+                if (!RegisterActive(taskId, proc.Id, () => { try { if (!proc.HasExited) proc.Kill(); } catch { } })) return -1;
+                var errParser = new WingetOutputParser { OnLine = parser.OnLine };
+                Task outReader = Task.Run(() => PumpReader(proc.StandardOutput, parser));
+                Task errReader = Task.Run(() => PumpReader(proc.StandardError, errParser));
+                proc.WaitForExit();
+                Task.WaitAll(new[] { outReader, errReader }, 2000);
+                if (string.IsNullOrEmpty(parser.LastProblemLine)) parser.LastProblemLine = errParser.LastProblemLine;
+                return proc.ExitCode;
             }
+        }
+
+        private static void PumpReader(StreamReader reader, WingetOutputParser parser)
+        {
+            var buf = new char[2048];
+            int n;
+            try
+            {
+                while ((n = reader.Read(buf, 0, buf.Length)) > 0) parser.Feed(buf, n);
+            }
+            catch { }
+            parser.Flush();
+        }
+
+        // Publishes the running process so cancel/close can kill it. Returns false (after killing it)
+        // if the task was cancelled before the process even started.
+        private bool RegisterActive(string taskId, int pid, Action terminate)
+        {
+            bool cancelled;
+            lock (procLock)
+            {
+                activePid = pid;
+                activeTerminate = terminate;
+                cancelled = cancelledTaskId == taskId;
+            }
+            if (cancelled)
+            {
+                KillActiveProcess();
+                return false;
+            }
+            return true;
+        }
+
+        private void CancelTask(string taskId)
+        {
+            lock (procLock)
+            {
+                if (activeTaskId == null || (!string.IsNullOrEmpty(taskId) && activeTaskId != taskId)) return;
+                cancelledTaskId = activeTaskId;
+            }
+            KillActiveProcess();
         }
 
         private void KillActiveProcess()
         {
+            int pid;
+            Action terminate;
             lock (procLock)
             {
-                if (activeProcess != null)
+                pid = activePid;
+                terminate = activeTerminate;
+                activePid = 0;
+                activeTerminate = null;
+            }
+            if (pid == 0) return;
+            try
+            {
+                // winget spawns the real installer as a child; killing winget alone would orphan it
+                using (var killer = Process.Start(new ProcessStartInfo
                 {
-                    try
-                    {
-                        if (!activeProcess.HasExited)
-                        {
-                            // winget spawns the real installer as a child; Kill() alone would orphan it
-                            using (var killer = Process.Start(new ProcessStartInfo
-                            {
-                                FileName = "taskkill",
-                                Arguments = "/PID " + activeProcess.Id + " /T /F",
-                                UseShellExecute = false,
-                                CreateNoWindow = true
-                            }))
-                            {
-                                if (killer != null) killer.WaitForExit(3000);
-                            }
-                            if (!activeProcess.HasExited) activeProcess.Kill();
-                        }
-                    }
-                    catch { }
-                    activeProcess = null;
+                    FileName = "taskkill",
+                    Arguments = "/PID " + pid + " /T /F",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }))
+                {
+                    if (killer != null) killer.WaitForExit(3000);
                 }
             }
+            catch { }
+            try { if (terminate != null) terminate(); } catch { }
+        }
+
+        // Ask winget whether `id` is installed right now. ok=false means winget itself failed, so a
+        // missing row proves nothing.
+        private Dictionary<string, string> QueryInstalledPackage(string id, out bool ok)
+        {
+            int code;
+            string output = RunWingetCapture(
+                "list -e --id \"" + SanitizeWingetArg(id) + "\" --accept-source-agreements --disable-interactivity", 45000, out code);
+            if (code == WINGET_NO_PACKAGES_FOUND)
+            {
+                ok = true;
+                return null;
+            }
+            ok = (code == 0);
+            foreach (var row in ParseWingetTable(output))
+            {
+                if (string.Equals(row["id"], id, StringComparison.OrdinalIgnoreCase)) return row;
+            }
+            return null;
+        }
+
+        private string VerifyTaskOutcome(string taskId, string operation, string id, string fromVersion,
+            out Dictionary<string, string> row)
+        {
+            // Upgrades are synchronous in practice; installs/uninstalls may finish in the background
+            int budgetMs = operation == "upgrade" ? 8000 : 45000;
+            var sw = Stopwatch.StartNew();
+            bool announced = false;
+            row = null;
+            while (true)
+            {
+                if (IsCancelled(taskId)) return "unknown";
+                bool ok;
+                row = QueryInstalledPackage(id, out ok);
+                if (ok)
+                {
+                    if (operation == "uninstall" && row == null) return "confirmed";
+                    if (operation == "install" && row != null) return "confirmed";
+                    if (operation == "upgrade" && row != null &&
+                        (string.IsNullOrWhiteSpace(row["available"]) ||
+                         !string.Equals(row["version"], fromVersion ?? "", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        return "confirmed";
+                    }
+                }
+                if (sw.ElapsedMilliseconds > budgetMs) return ok ? "pending" : "unknown";
+                if (!announced)
+                {
+                    announced = true;
+                    SendToUi(new
+                    {
+                        type = "task_log",
+                        taskId = taskId,
+                        packageId = id,
+                        line = operation == "uninstall"
+                            ? "winget finished; waiting for the uninstaller to remove the package..."
+                            : "winget finished; waiting for the package to show up as installed..."
+                    });
+                }
+                Thread.Sleep(2500);
+            }
+        }
+
+        // Windows taskbar button progress (ITaskbarList3). state: 0 none, 1 indeterminate, 2 normal.
+        [ComImport, Guid("ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface ITaskbarList3
+        {
+            void HrInit();
+            void AddTab(IntPtr hwnd);
+            void DeleteTab(IntPtr hwnd);
+            void ActivateTab(IntPtr hwnd);
+            void SetActiveAlt(IntPtr hwnd);
+            void MarkFullscreenWindow(IntPtr hwnd, [MarshalAs(UnmanagedType.Bool)] bool fullscreen);
+            void SetProgressValue(IntPtr hwnd, ulong completed, ulong total);
+            void SetProgressState(IntPtr hwnd, int flags);
+        }
+
+        [ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090"), ClassInterface(ClassInterfaceType.None)]
+        private class TaskbarListClass { }
+
+        private ITaskbarList3 taskbar;
+
+        private void SetTaskbarProgress(int state, int percent)
+        {
+            if (this.IsDisposed || !this.IsHandleCreated) return;
+            if (this.InvokeRequired)
+            {
+                try { this.BeginInvoke(new Action(() => SetTaskbarProgress(state, percent))); } catch { }
+                return;
+            }
+            try
+            {
+                if (taskbar == null)
+                {
+                    taskbar = (ITaskbarList3)new TaskbarListClass();
+                    taskbar.HrInit();
+                }
+                int flags = state == 2 ? 0x2 : state == 1 ? 0x1 : 0x0;
+                taskbar.SetProgressState(this.Handle, flags);
+                if (state == 2) taskbar.SetProgressValue(this.Handle, (ulong)percent, 100UL);
+            }
+            catch { }
         }
 
         private string RunWingetCapture(string arguments, int timeoutMs = 60000)
         {
+            int ignored;
+            return RunWingetCapture(arguments, timeoutMs, out ignored);
+        }
+
+        // exitCode is -1 when winget could not be started or timed out
+        private string RunWingetCapture(string arguments, int timeoutMs, out int exitCode)
+        {
+            exitCode = -1;
             try
             {
                 var psi = new ProcessStartInfo
@@ -1740,6 +2046,10 @@ namespace WingetUI
                     {
                         try { proc.Kill(); } catch { }
                     }
+                    else
+                    {
+                        exitCode = proc.ExitCode;
+                    }
                     Task.WaitAll(new[] { outTask, errTask }, 3000);
                     string outStr = outTask.IsCompleted ? outTask.Result : "";
                     string errStr = errTask.IsCompleted ? errTask.Result : "";
@@ -1752,7 +2062,7 @@ namespace WingetUI
             }
             catch (Exception ex)
             {
-                return "Error: " + ex.Message;
+                return "Error: " + DescribeStartFailure(ex);
             }
         }
 
@@ -1896,6 +2206,17 @@ namespace WingetUI
             return str.Substring(start, end - start).Trim();
         }
 
+        // Friendly text for the "winget.exe not found" case (App Installer missing or broken)
+        private static string DescribeStartFailure(Exception ex)
+        {
+            var w32 = ex as System.ComponentModel.Win32Exception;
+            if (w32 != null && (w32.NativeErrorCode == 2 || w32.NativeErrorCode == 3))
+            {
+                return "winget.exe was not found. Install or update \"App Installer\" from the Microsoft Store, then restart WingetUI.";
+            }
+            return ex.Message;
+        }
+
         [STAThread]
         public static void Main()
         {
@@ -1917,6 +2238,318 @@ namespace WingetUI
                 }
                 Application.Run(new MainForm());
             }
+        }
+    }
+
+    // Runs a command attached to a Windows pseudo console (ConPTY). winget only draws its download
+    // progress (and the OSC 9;4 percent sequences) when it believes it is talking to a terminal; with
+    // plain redirected pipes it prints nothing between "Downloading ..." and "Successfully verified".
+    // Start() returns null when ConPTY is unavailable (pre-1809 Windows), and callers fall back to pipes.
+    internal sealed class PtyProcess : IDisposable
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct COORD { public short X; public short Y; }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct STARTUPINFO
+        {
+            public int cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+            public short wShowWindow, cbReserved2;
+            public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct STARTUPINFOEX { public STARTUPINFO StartupInfo; public IntPtr lpAttributeList; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CreatePipe(out Microsoft.Win32.SafeHandles.SafeFileHandle r, out Microsoft.Win32.SafeHandles.SafeFileHandle w, IntPtr sa, int size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern int CreatePseudoConsole(COORD size, Microsoft.Win32.SafeHandles.SafeFileHandle hIn, Microsoft.Win32.SafeHandles.SafeFileHandle hOut, uint flags, out IntPtr hpc);
+        [DllImport("kernel32.dll")]
+        private static extern void ClosePseudoConsole(IntPtr hpc);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attr, IntPtr val, IntPtr cb, IntPtr prev, IntPtr ret);
+        [DllImport("kernel32.dll")]
+        private static extern void DeleteProcThreadAttributeList(IntPtr list);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool CreateProcess(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags,
+            IntPtr env, string cwd, ref STARTUPINFOEX si, out PROCESS_INFORMATION pi);
+        [DllImport("kernel32.dll")]
+        private static extern uint WaitForSingleObject(IntPtr h, uint ms);
+        [DllImport("kernel32.dll")]
+        private static extern bool GetExitCodeProcess(IntPtr h, out int code);
+        [DllImport("kernel32.dll")]
+        private static extern bool TerminateProcess(IntPtr h, uint code);
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr h);
+
+        private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+        private const int STARTF_USESTDHANDLES = 0x00000100;
+        private static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = (IntPtr)0x00020016;
+
+        private IntPtr hpc = IntPtr.Zero;
+        private IntPtr hProcess = IntPtr.Zero;
+        private IntPtr attrList = IntPtr.Zero;
+        private Microsoft.Win32.SafeHandles.SafeFileHandle inWrite;
+        private readonly object closeLock = new object();
+
+        public int Pid { get; private set; }
+        public Stream Output { get; private set; }
+
+        private PtyProcess() { }
+
+        // Throws Win32Exception when the executable cannot be started (e.g. winget missing).
+        public static PtyProcess Start(string commandLine)
+        {
+            Microsoft.Win32.SafeHandles.SafeFileHandle inRead = null, inWrite = null, outRead = null, outWrite = null;
+            var p = new PtyProcess();
+            try
+            {
+                if (!CreatePipe(out inRead, out inWrite, IntPtr.Zero, 0)) return null;
+                if (!CreatePipe(out outRead, out outWrite, IntPtr.Zero, 0)) return null;
+
+                IntPtr pc;
+                int hr;
+                try
+                {
+                    // Wide enough that winget never wraps a progress or table line
+                    hr = CreatePseudoConsole(new COORD { X = 240, Y = 60 }, inRead, outWrite, 0, out pc);
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    return null;
+                }
+                if (hr != 0) return null;
+                p.hpc = pc;
+
+                IntPtr size = IntPtr.Zero;
+                InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+                p.attrList = Marshal.AllocHGlobal(size);
+                if (!InitializeProcThreadAttributeList(p.attrList, 1, 0, ref size)) { p.Dispose(); return null; }
+                if (!UpdateProcThreadAttribute(p.attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, pc,
+                        (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
+                {
+                    p.Dispose();
+                    return null;
+                }
+
+                var si = new STARTUPINFOEX();
+                si.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+                // Without this the child can pick up the parent's std handles instead of the pseudo console
+                si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                si.lpAttributeList = p.attrList;
+
+                PROCESS_INFORMATION pi;
+                if (!CreateProcess(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false,
+                        EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, null, ref si, out pi))
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    p.Dispose();
+                    throw new System.ComponentModel.Win32Exception(err);
+                }
+                CloseHandle(pi.hThread);
+                p.hProcess = pi.hProcess;
+                p.Pid = pi.dwProcessId;
+                p.inWrite = inWrite;
+                inWrite = null;
+                p.Output = new FileStream(outRead, FileAccess.Read, 4096, false);
+                outRead = null;
+                return p;
+            }
+            finally
+            {
+                // The pseudo console holds its own duplicates of these ends
+                if (inRead != null) inRead.Dispose();
+                if (outWrite != null) outWrite.Dispose();
+                if (inWrite != null) inWrite.Dispose();
+                if (outRead != null) outRead.Dispose();
+            }
+        }
+
+        public bool HasExited
+        {
+            get { return hProcess == IntPtr.Zero || WaitForSingleObject(hProcess, 0) == 0; }
+        }
+
+        public void WaitForExit()
+        {
+            if (hProcess != IntPtr.Zero) WaitForSingleObject(hProcess, 0xFFFFFFFF);
+        }
+
+        public int ExitCode
+        {
+            get
+            {
+                int code = -1;
+                if (hProcess != IntPtr.Zero) GetExitCodeProcess(hProcess, out code);
+                return code;
+            }
+        }
+
+        public void Terminate()
+        {
+            if (hProcess != IntPtr.Zero && !HasExited) TerminateProcess(hProcess, 1);
+        }
+
+        // Closing the pseudo console flushes its remaining output and ends the Output stream (EOF).
+        public void ClosePseudoConsole()
+        {
+            lock (closeLock)
+            {
+                if (hpc != IntPtr.Zero)
+                {
+                    ClosePseudoConsole(hpc);
+                    hpc = IntPtr.Zero;
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            ClosePseudoConsole();
+            if (inWrite != null) { inWrite.Dispose(); inWrite = null; }
+            if (Output != null) { try { Output.Dispose(); } catch { } Output = null; }
+            if (attrList != IntPtr.Zero)
+            {
+                DeleteProcThreadAttributeList(attrList);
+                Marshal.FreeHGlobal(attrList);
+                attrList = IntPtr.Zero;
+            }
+            if (hProcess != IntPtr.Zero)
+            {
+                CloseHandle(hProcess);
+                hProcess = IntPtr.Zero;
+            }
+        }
+    }
+
+    // Turns raw winget console output (VT sequences, \r-redrawn progress bars, spinner frames) into
+    // clean log lines plus structured progress. Locale-independent where it matters: the percentage
+    // comes from winget's OSC 9;4 taskbar-progress sequence, not from parsing translated text.
+    internal sealed class WingetOutputParser
+    {
+        public Action<string> OnLine;                 // a real, human-readable output line
+        public Action<int, int> OnProgress;           // (state, percent): state 1 = percent, 3 = indeterminate, 0 = cleared
+        public Action<string> OnBytes;                // "14.0 MB / 60.4 MB"
+        public string LastProblemLine = "";
+
+        private enum Mode { Text, Esc, Csi, Osc, OscEsc }
+        private Mode mode = Mode.Text;
+        private readonly StringBuilder line = new StringBuilder();
+        private readonly StringBuilder osc = new StringBuilder();
+        private string lastLine = "";
+
+        private static readonly Regex SpinnerRx = new Regex(@"^[-\\|/]$");
+        private static readonly Regex LeadingSpinnerRx = new Regex(@"^(?:[-\\|/]\s+)+");
+        private static readonly Regex BytesRx = new Regex(
+            @"([\d.,]+\s*[KMGT]?i?B)\s*/\s*([\d.,]+\s*[KMGT]?i?B)\s*$", RegexOptions.IgnoreCase);
+        private static readonly Regex PercentRx = new Regex(@"^[▀-▟\s]*(\d{1,3})\s*%\s*$");
+        private static readonly Regex BarCharsRx = new Regex(@"[▀-▟]");
+        private static readonly Regex ProblemRx = new Regex(
+            @"fail|error|cannot|unable|not found|denied|blocked|restart|reboot", RegexOptions.IgnoreCase);
+
+        public void Feed(char[] buf, int count)
+        {
+            for (int i = 0; i < count; i++) FeedChar(buf[i]);
+        }
+
+        public void Flush()
+        {
+            EmitLine();
+        }
+
+        private void FeedChar(char c)
+        {
+            switch (mode)
+            {
+                case Mode.Text:
+                    if (c == '\x1b') { mode = Mode.Esc; return; }
+                    if (c == '\r' || c == '\n') { EmitLine(); return; }
+                    if (c == '\x07' || c == '\b') return;
+                    line.Append(c);
+                    return;
+
+                case Mode.Esc:
+                    if (c == '[') { mode = Mode.Csi; return; }
+                    if (c == ']') { osc.Clear(); mode = Mode.Osc; return; }
+                    mode = Mode.Text;   // two-character escape (ESC 7, ESC =, ...): drop it
+                    return;
+
+                case Mode.Csi:
+                    // Parameters/intermediates are 0x20-0x3F; the final byte (0x40-0x7E) ends the sequence
+                    if (c >= '@' && c <= '~')
+                    {
+                        mode = Mode.Text;
+                        // Cursor-forward is how ConPTY paints the empty part of a progress bar; keep a gap
+                        if (c == 'C' && line.Length > 0 && line[line.Length - 1] != ' ') line.Append(' ');
+                    }
+                    return;
+
+                case Mode.Osc:
+                    if (c == '\x07') { EndOsc(); return; }
+                    if (c == '\x1b') { mode = Mode.OscEsc; return; }
+                    if (osc.Length < 512) osc.Append(c);
+                    return;
+
+                case Mode.OscEsc:
+                    EndOsc();   // ESC \ (string terminator); anything else also ends the OSC
+                    return;
+            }
+        }
+
+        private void EndOsc()
+        {
+            mode = Mode.Text;
+            string s = osc.ToString();
+            osc.Clear();
+            if (!s.StartsWith("9;4;")) return;   // window titles etc.
+            string[] parts = s.Split(';');
+            int state, pct = 0;
+            if (parts.Length >= 3 && int.TryParse(parts[2], out state))
+            {
+                if (parts.Length >= 4) int.TryParse(parts[3], out pct);
+                if (OnProgress != null) OnProgress(state, Math.Max(0, Math.Min(100, pct)));
+            }
+        }
+
+        private void EmitLine()
+        {
+            if (line.Length == 0) return;
+            string text = line.ToString().Trim();
+            line.Clear();
+            // ConPTY repaints spinner frames in place, so several can be left in front of the real text
+            text = LeadingSpinnerRx.Replace(text, "");
+            if (text.Length == 0 || SpinnerRx.IsMatch(text)) return;
+
+            Match m = BytesRx.Match(text);
+            if (m.Success && (BarCharsRx.IsMatch(text) || text.Length == m.Length))
+            {
+                if (OnBytes != null) OnBytes(m.Groups[1].Value.Trim() + " / " + m.Groups[2].Value.Trim());
+                return;
+            }
+            Match pm = PercentRx.Match(text);
+            if (pm.Success)
+            {
+                int pct;
+                if (int.TryParse(pm.Groups[1].Value, out pct) && OnProgress != null) OnProgress(1, Math.Min(100, pct));
+                return;
+            }
+            // A bare bar with no numbers yet
+            if (BarCharsRx.Replace(text, "").Trim().Length == 0) return;
+
+            if (text == lastLine) return;
+            lastLine = text;
+            if (ProblemRx.IsMatch(text)) LastProblemLine = text;
+            if (OnLine != null) OnLine(text);
         }
     }
 }

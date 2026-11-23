@@ -1635,3 +1635,274 @@ code, pre, .pkg-id {
 .trust-banner.community .trust-title { color: #fbbf24; }
 .search-filter-row { display: flex; align-items: center; gap: 14px; margin: 0 0 10px; }
 .search-trust-note { font-size: 12px; color: var(--text-muted, #8a93a6); }
+
+/* ---- Task progress (console bar, cards, table rows) ---- */
+.console-status-left {
+  position: relative;
+  min-width: 0;
+  flex: 1;
+}
+
+.console-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+.task-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.task-progress .mini-progress {
+  width: 180px;
+}
+
+.task-progress-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mini-progress {
+  position: relative;
+  height: 6px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.mini-progress-fill {
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--accent), #8b5cf6);
+  transition: width 0.18s ease;
+}
+
+.mini-progress.indeterminate .mini-progress-fill {
+  position: absolute;
+  left: 0;
+  width: 35% !important;
+  transition: none;
+  animation: mini-progress-slide 1.15s ease-in-out infinite;
+}
+
+@keyframes mini-progress-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(290%); }
+}
+
+.task-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.task-inline.running .mini-progress {
+  width: 110px;
+}
+
+.task-inline-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #a5b4fc;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.app-card .card-bottom .task-inline {
+  flex: 1;
+}
+
+.app-card .card-bottom .task-inline.running .mini-progress {
+  flex: 1;
+  width: auto;
+}
+
+.btn-dequeue {
+  padding: 2px 7px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* Queue pill + popover */
+button.queue-pill {
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+button.queue-pill:hover {
+  background: rgba(99, 102, 241, 0.26);
+  color: #c7d2fe;
+}
+
+.queue-popover {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 0;
+  width: 340px;
+  max-height: 300px;
+  overflow-y: auto;
+  background: var(--bg-elevated);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-md);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
+  padding: 8px;
+  z-index: 50;
+  cursor: default;
+  animation: fadeIn 0.15s ease;
+}
+
+.queue-popover-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding: 4px 6px 8px;
+  text-transform: uppercase;
+}
+
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+}
+
+.queue-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.queue-index {
+  width: 18px;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.queue-op {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 99px;
+  background: var(--accent-soft);
+  color: #a5b4fc;
+}
+
+.queue-op-upgrade {
+  background: var(--amber-soft);
+  color: #fbbf24;
+}
+
+.queue-op-uninstall {
+  background: var(--danger-soft);
+  color: #f87171;
+}
+
+.queue-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Confirm dialog */
+.modal-card-confirm {
+  width: 440px;
+}
+
+.confirm-message {
+  margin: 4px 0 18px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: #fff;
+}
+
+.btn-danger:hover {
+  background: #dc2626;
+}
+
+/* Toast variants */
+.toast {
+  cursor: pointer;
+  max-width: 420px;
+  line-height: 1.45;
+}
+
+.toast-success {
+  border-left: 3px solid var(--emerald);
+}
+
+.toast-warn {
+  border-left: 3px solid var(--amber);
+}
+
+.toast-error {
+  border-left: 3px solid var(--danger);
+}
+
+/* Busy / disabled / focus states for all buttons */
+.btn:active:not(:disabled),
+.btn-icon:active:not(:disabled),
+.btn-chip:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn:disabled,
+.btn-icon:disabled,
+.btn-chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn.is-busy {
+  opacity: 0.75;
+  cursor: progress;
+}
+
+.btn.is-busy svg {
+  animation: spin 1s linear infinite;
+}
+
+.btn:focus-visible,
+.btn-icon:focus-visible,
+.btn-chip:focus-visible,
+.cat-pill:focus-visible,
+.nav-item:focus-visible,
+.win-btn:focus-visible,
+.btn-close:focus-visible,
+button.queue-pill:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.empty-state .spinner {
+  margin: 0 auto 14px;
+}
+
+.app-version {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  text-align: center;
+  opacity: 0.7;
+}

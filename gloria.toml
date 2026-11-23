@@ -1,0 +1,11 @@
+id = "WingetUI"
+name = "WingetUI"
+version = "1.2.0"
+main_exe = "WingetUI.exe"
+icon = "WingetUI.ico"
+accent = "#6366f1"
+description = "Package & Preset Manager for winget"
+needs_webview2 = true
+# The app keeps its state in Data\ next to the exe (inside the install folder, kept across updates);
+# %LOCALAPPDATA%\WingetUI is its fallback when that folder is read-only.
+data_folders = ['%LOCALAPPDATA%\WingetUI']

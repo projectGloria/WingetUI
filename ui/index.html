@@ -81,6 +81,7 @@
           <span>Sync to winget.txt</span>
         </button>
         <div class="scan-status" id="scan-status-text">Ready</div>
+        <div class="app-version" id="app-version"></div>
       </div>
     </aside>
 
@@ -231,12 +232,18 @@
         <div class="console-bar" id="console-bar">
           <div class="console-status-left">
             <span class="status-dot" id="task-dot"></span>
-            <span class="console-title" id="task-summary">Idle — No active tasks</span>
-            <span class="queue-pill hidden" id="queue-pill">0 queued</span>
+            <span class="console-title" id="task-summary">Idle — Ready</span>
+            <div class="task-progress hidden" id="task-progress">
+              <div class="mini-progress indeterminate" id="task-progress-bar"><div class="mini-progress-fill" id="task-progress-fill"></div></div>
+              <span class="task-progress-text" id="task-progress-text"></span>
+            </div>
+            <button class="queue-pill hidden" id="queue-pill" title="Show queued tasks">0 queued</button>
+            <div class="queue-popover hidden" id="queue-popover"></div>
           </div>
           <div class="console-actions">
-            <button class="btn btn-danger-sm hidden" id="btn-cancel-task">Cancel</button>
-            <button class="btn-icon" id="btn-clear-log" title="Clear log output">Clear</button>
+            <button class="btn btn-danger-sm hidden" id="btn-cancel-task" title="Stop the running task">Cancel</button>
+            <button class="btn-icon hidden" id="btn-clear-queue" title="Remove all queued tasks">Clear queue</button>
+            <button class="btn-icon" id="btn-clear-log" title="Clear log output">Clear log</button>
             <button class="btn-icon" id="btn-toggle-console" title="Toggle live terminal output">
               <span id="console-toggle-label">Terminal ▲</span>
             </button>
@@ -397,6 +404,7 @@
         </div>
         <div class="modal-footer-right">
           <button class="btn btn-secondary" id="btn-detail-add-preset">+ Add to Presets</button>
+          <button class="btn btn-danger-outline hidden" id="btn-detail-uninstall">Uninstall</button>
           <button class="btn btn-primary" id="btn-detail-action">Install</button>
           <button class="btn btn-ghost" id="btn-detail-close">Close</button>
         </div>
@@ -404,7 +412,21 @@
     </div>
   </div>
 
-  <div class="toast-container" id="toast-container"></div>
+  <!-- Modal: confirmation (destructive actions) -->
+  <div class="modal-backdrop hidden" id="modal-confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <div class="modal-card modal-card-confirm">
+      <div class="modal-header">
+        <h3 id="confirm-title">Are you sure?</h3>
+      </div>
+      <p class="confirm-message" id="confirm-message"></p>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" id="btn-confirm-cancel">Cancel</button>
+        <button type="button" class="btn btn-primary" id="btn-confirm-ok">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
   <script src="app.js"></script>
 </body>

@@ -41,7 +41,7 @@ It compiles directly with Windows' built-in .NET Framework compiler (`csc.exe`) 
 - **Update Tracking with Release Dates & Notes**: Combines `winget list` and `winget upgrade --include-unknown` with manifest lookups against `microsoft/winget-pkgs` to surface release dates and release-notes links alongside one-click **Update** and **Update All** actions.
 - **Verified-Publisher Catalog Search**: Searches the official Winget repository (`winget search`), scores publisher authenticity against package domains and Microsoft Store certification, and filters out unverified community packages by default.
 - **Package Inspection & Integrity Verification**: Open any package's details modal to inspect its publisher, author, catalog source, license, installer type, download host, official URLs, and installer SHA-256 hash before installing.
-- **Live Terminal Drawer & Cancellable Tasks**: Runs mutating `winget` commands sequentially from a UI task queue, streams live output into a collapsible console drawer, and lets you cancel an active operation at any time.
+- **Live Progress, Queue & Cancellable Tasks**: Runs mutating `winget` commands sequentially from a UI task queue with real download progress (percent and MB) on the package's card or row, in the status bar, and on the taskbar button. Queued tasks can be reviewed and removed, the running task can be cancelled, and each result is confirmed against `winget list` before the UI marks an app installed or removed. Live output streams into a collapsible console drawer.
 - **Portable Data & Markdown Export**: Keeps presets, a 7-day metadata cache (`meta-cache.json`), and the WebView2 profile inside a local `Data\` folder next to `WingetUI.exe` (falling back to `%LOCALAPPDATA%\WingetUI` when read-only), and exports your preset list to `Data\winget.txt`.
 
 ## Screenshots
@@ -150,15 +150,11 @@ On first launch, WingetUI copies the seed [presets.json](presets.json) into `Dat
 
 ## How to Release
 
-Pushing a version tag starting with `v` triggers the [Build Installers](.github/workflows/build-installers.yml) workflow on GitHub Actions, which compiles the Windows x64 Inno Setup installer (`WingetUI-<version>-windows-x64.exe`), uploads it as the `installers` workflow artifact, and publishes a GitHub Release with the installer attached:
+Releases are built with [GloriaSetup](https://github.com/projectGloria/GloriaSetup) from [`gloria.toml`](gloria.toml). To release, bump the version in `gloria.toml` and the three assembly attributes at the top of `WingetUI.cs`, then push to `main`. The [Release](.github/workflows/release.yml) workflow notices the version change, builds `WingetUI_<version>_x64-setup.exe` (bundling the WebView2 bootstrapper for PCs without the runtime), verifies it with a silent dry run, and publishes GitHub Release `v<version>` with the installer and `SHA256SUMS.txt`. Pushes that don't change the version build nothing. No manual tags are needed.
 
-```bash
-git tag v1.0.0
-git push --tags
-```
-
-- **Download released installers**: Go to the repository's [Releases](https://github.com/projectGloria/WingetUI/releases) page and download `WingetUI-<version>-windows-x64.exe`.
-- **Manual test builds (without publishing a release)**: Open **Actions → Build Installers → Run workflow** on GitHub, optionally enter a version string, and download the `installers` artifact from the completed workflow run.
+- **Download released installers**: Go to the repository's [Releases](https://github.com/projectGloria/WingetUI/releases) page and download `WingetUI_<version>_x64-setup.exe`. It installs per-user (no admin) under `%LOCALAPPDATA%\Programs\WingetUI` and replaces a v1.0/v1.1 Inno Setup install automatically; your presets carry over (from the old install's `Data\` folder, or from `%LOCALAPPDATA%\WingetUI` for an all-users install).
+- **Manual test builds (without publishing a release)**: Open **Actions → Release → Run workflow** on GitHub with **dry_run** ticked, then download the `installer` artifact from the completed run.
+- **Build an installer locally**: Run `.\build.ps1`, then `npx --yes gloria-setup@0.2.0 --app dist\WingetUI --manifest gloria.toml --out dist` (add `--webview2-bootstrapper <MicrosoftEdgeWebview2Setup.exe>` to bundle the WebView2 installer).
 
 ## Configuration
 
